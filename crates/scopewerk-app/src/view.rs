@@ -21,6 +21,10 @@ use scopewerk_core::{
     Acquisition, Action, Capture, Change, Coupling, Edge, Identity, Request, Settings, Sweep,
 };
 
+use scopewerk_core::decode::{
+    self, DecodeConfig, Decoded, Input, STANDARD_BAUDS, STANDARD_BITRATES, recommended_timebase,
+};
+
 use crate::plot::{self, Geometry, Scene, time_of, value_at, x_div_of};
 use crate::service::{Activity, Event, Job, LiveMode, ServiceHandle};
 use crate::theme;
@@ -109,6 +113,12 @@ pub(crate) struct ScopeView {
     activity: VecDeque<Activity>,
     notice: Option<(String, bool, Instant)>,
     scroll: f32,
+    /// The running protocol decoder, if any.
+    decoder: Option<DecodeConfig>,
+    /// Its result on the newest frame.
+    decoded: Option<Arc<Decoded>>,
+    /// Whether memory mode was on before decoding switched it on.
+    memory_before_decode: Option<bool>,
 }
 
 impl ScopeView {
@@ -163,7 +173,7 @@ impl ScopeView {
             selected: 1,
             live: LiveMode {
                 paused: false,
-                memory: false,
+                memory: std::env::var_os("SCOPEWERK_DEMO").is_some_and(|v| !v.is_empty()),
             },
             afterglow: true,
             geometry: Rc::new(Cell::new(None)),
@@ -172,6 +182,16 @@ impl ScopeView {
             activity: VecDeque::new(),
             notice: None,
             scroll: 0.0,
+            // The demo bus shows off the CAN decoder right away.
+            decoder: std::env::var_os("SCOPEWERK_DEMO")
+                .is_some_and(|v| !v.is_empty())
+                .then_some(DecodeConfig::Can {
+                    input: Input::Ch1MinusCh2,
+                    bitrate: None,
+                    dominant_high: None,
+                }),
+            decoded: None,
+            memory_before_decode: None,
         }
     }
 
@@ -208,6 +228,11 @@ impl ScopeView {
                 {
                     self.selected = first.channel;
                 }
+                self.decoded = self
+                    .decoder
+                    .as_ref()
+                    .and_then(|config| decode::decode(&capture, config).ok())
+                    .map(Arc::new);
                 self.frames.push_back(capture);
                 while self.frames.len() > AFTERGLOW_FRAMES {
                     self.frames.pop_front();
@@ -869,6 +894,14 @@ impl ScopeView {
                 .cursors
                 .map(|c| c.zip(self.settings.as_ref()).map(|(t, s)| x_div_of(t, s))),
             afterglow: self.afterglow,
+            annotations: self.decoder.as_ref().map(|_| {
+                Arc::new(
+                    self.decoded
+                        .as_ref()
+                        .map(|d| d.annotations.clone())
+                        .unwrap_or_default(),
+                )
+            }),
         };
         let empty = match &self.connection {
             Connection::Searching(reason) => Some(
@@ -1082,6 +1115,9 @@ impl ScopeView {
                     .child(cell("Rise", opt_si(s.rise_time_s, "s"))),
             );
         }
+        if let Some(decoded) = &self.decoded {
+            strip = strip.child(decoded_table(decoded));
+        }
         strip
     }
 
@@ -1117,6 +1153,7 @@ impl ScopeView {
             .child(self.channel_card(&settings, 2, cx))
             .child(self.trigger_card(&settings, cx))
             .child(self.acquire_card(&settings, cx))
+            .child(self.decode_card(&settings, cx))
             .child(self.activity_card())
     }
 
@@ -1656,4 +1693,412 @@ impl Render for ScopeView {
                     .child(self.controls(cx)),
             )
     }
+}
+
+// ---- protocol decoding --------------------------------------------------------------------
+
+/// The decoders offered in the panel, with their defaults.
+fn default_config(protocol: &str) -> Option<DecodeConfig> {
+    Some(match protocol {
+        "CAN" => DecodeConfig::Can {
+            input: Input::Ch1,
+            bitrate: None,
+            dominant_high: None,
+        },
+        "I²C" => DecodeConfig::I2c { scl: 1, sda: 2 },
+        "SPI" => DecodeConfig::Spi {
+            clk: 1,
+            data: 2,
+            mode: None,
+            bits: 8,
+            lsb_first: false,
+        },
+        "UART" => DecodeConfig::Uart {
+            input: Input::Ch1,
+            baud: None,
+            data_bits: 8,
+            parity: decode::Parity::None,
+            inverted: false,
+        },
+        _ => return None,
+    })
+}
+
+/// Step through Auto and a list of standard rates (ascending).
+fn step_rate(current: Option<f64>, rates: &[f64], direction: i32) -> Option<f64> {
+    let mut ascending = rates.to_vec();
+    ascending.sort_by(f64::total_cmp);
+    let index = current.and_then(|c| ascending.iter().position(|r| (r - c).abs() < c * 1e-3));
+    match (index, direction > 0) {
+        (None, true) => ascending.first().copied(),
+        (None, false) => None,
+        (Some(0), false) => None,
+        (Some(i), false) => Some(ascending[i - 1]),
+        (Some(i), true) => Some(ascending[(i + 1).min(ascending.len() - 1)]),
+    }
+}
+
+fn rate_label(rate: Option<f64>, detected: Option<f64>, unit: &str) -> String {
+    match (rate, detected) {
+        (Some(rate), _) => format_si(rate, unit),
+        (None, Some(found)) => format!("Auto · {}", format_si(found, unit)),
+        (None, None) => "Auto".to_owned(),
+    }
+}
+
+impl ScopeView {
+    fn set_decoder(&mut self, config: Option<DecodeConfig>, cx: &mut Context<'_, Self>) {
+        match (&self.decoder, &config) {
+            (None, Some(_)) => {
+                // Decoding needs the 10 000-sample memory.
+                self.memory_before_decode = Some(self.live.memory);
+                if !self.live.memory {
+                    self.set_live(
+                        LiveMode {
+                            memory: true,
+                            ..self.live
+                        },
+                        cx,
+                    );
+                }
+            }
+            (Some(_), None) if self.memory_before_decode.take() == Some(false) => {
+                self.set_live(
+                    LiveMode {
+                        memory: false,
+                        ..self.live
+                    },
+                    cx,
+                );
+            }
+            _ => {}
+        }
+        self.decoder = config;
+        self.decoded = None;
+        if let (Some(config), Some(frame)) = (&self.decoder, self.frames.back()) {
+            self.decoded = decode::decode(frame, config).ok().map(Arc::new);
+        }
+        cx.notify();
+    }
+
+    fn update_decoder(
+        &mut self,
+        change: impl FnOnce(&mut DecodeConfig),
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(mut config) = self.decoder.clone() {
+            change(&mut config);
+            self.set_decoder(Some(config), cx);
+        }
+    }
+
+    fn decode_card(&self, settings: &Settings, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let current = self.decoder.as_ref().map(DecodeConfig::protocol);
+        let protocols: Vec<_> = ["Off", "CAN", "I²C", "SPI", "UART"]
+            .iter()
+            .map(|&name| {
+                let on = current.map_or(name == "Off", |p| p == name);
+                segment(format!("dec-{name}"), name, on, theme::agent()).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        if this.decoder.as_ref().map(DecodeConfig::protocol) != Some(name) {
+                            this.set_decoder(default_config(name), cx);
+                        }
+                    },
+                ))
+            })
+            .collect();
+        let mut body = vec![segments(protocols).into_any_element()];
+        let detected = self.decoded.as_ref().and_then(|d| d.rate_hz);
+        let input_row = |id: &str, input: Input, cx: &mut Context<'_, Self>, choices: &[Input]| {
+            let buttons: Vec<_> = choices
+                .iter()
+                .map(|&choice| {
+                    segment(
+                        format!("{id}-{}", choice.label()),
+                        choice.label(),
+                        input == choice,
+                        theme::agent(),
+                    )
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.update_decoder(
+                                |c| match c {
+                                    DecodeConfig::Can { input, .. }
+                                    | DecodeConfig::Uart { input, .. } => *input = choice,
+                                    _ => {}
+                                },
+                                cx,
+                            );
+                        },
+                    ))
+                })
+                .collect();
+            segments(buttons).into_any_element()
+        };
+        match self.decoder.clone() {
+            Some(DecodeConfig::Can {
+                input,
+                bitrate,
+                dominant_high,
+            }) => {
+                body.push(input_row(
+                    "can-in",
+                    input,
+                    cx,
+                    &[Input::Ch1, Input::Ch2, Input::Ch1MinusCh2],
+                ));
+                body.push(self.stepper(
+                    "can-rate",
+                    "Bitrate",
+                    rate_label(bitrate, detected, "bit/s"),
+                    Box::new(move |this, cx| {
+                        this.update_decoder(
+                            |c| {
+                                if let DecodeConfig::Can { bitrate, .. } = c {
+                                    *bitrate = step_rate(*bitrate, &STANDARD_BITRATES, -1)
+                                }
+                            },
+                            cx,
+                        )
+                    }),
+                    Box::new(move |this, cx| {
+                        this.update_decoder(
+                            |c| {
+                                if let DecodeConfig::Can { bitrate, .. } = c {
+                                    *bitrate = step_rate(*bitrate, &STANDARD_BITRATES, 1)
+                                }
+                            },
+                            cx,
+                        )
+                    }),
+                    cx,
+                ));
+                let polarities: Vec<_> =
+                    [(None, "Auto"), (Some(true), "High"), (Some(false), "Low")]
+                        .iter()
+                        .map(|&(value, label)| {
+                            segment(
+                                format!("can-pol-{label}"),
+                                label,
+                                dominant_high == value,
+                                theme::agent(),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| {
+                                    this.update_decoder(
+                                        |c| {
+                                            if let DecodeConfig::Can { dominant_high, .. } = c {
+                                                *dominant_high = value
+                                            }
+                                        },
+                                        cx,
+                                    );
+                                },
+                            ))
+                        })
+                        .collect();
+                body.push(segments(polarities).into_any_element());
+            }
+            Some(DecodeConfig::I2c { scl, .. }) => {
+                let maps: Vec<_> = [(1u8, "SCL CH1 · SDA CH2"), (2u8, "SCL CH2 · SDA CH1")]
+                    .iter()
+                    .map(|&(clock, label)| {
+                        segment(format!("i2c-{clock}"), label, scl == clock, theme::agent())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.update_decoder(
+                                    |c| {
+                                        if let DecodeConfig::I2c { scl, sda } = c {
+                                            (*scl, *sda) = (clock, 3 - clock)
+                                        }
+                                    },
+                                    cx,
+                                );
+                            }))
+                    })
+                    .collect();
+                body.push(segments(maps).into_any_element());
+            }
+            Some(DecodeConfig::Spi { clk, mode, .. }) => {
+                let maps: Vec<_> = [(1u8, "CLK CH1 · data CH2"), (2u8, "CLK CH2 · data CH1")]
+                    .iter()
+                    .map(|&(clock, label)| {
+                        segment(format!("spi-{clock}"), label, clk == clock, theme::agent())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.update_decoder(
+                                    |c| {
+                                        if let DecodeConfig::Spi { clk, data, .. } = c {
+                                            (*clk, *data) = (clock, 3 - clock)
+                                        }
+                                    },
+                                    cx,
+                                );
+                            }))
+                    })
+                    .collect();
+                body.push(segments(maps).into_any_element());
+                let modes: Vec<_> = [None, Some(0u8), Some(1), Some(2), Some(3)]
+                    .iter()
+                    .map(|&value| {
+                        let label =
+                            value.map_or_else(|| "Auto".to_owned(), |m| format!("Mode {m}"));
+                        segment(
+                            format!("spi-mode-{label}"),
+                            label,
+                            mode == value,
+                            theme::agent(),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.update_decoder(
+                                    |c| {
+                                        if let DecodeConfig::Spi { mode, .. } = c {
+                                            *mode = value
+                                        }
+                                    },
+                                    cx,
+                                );
+                            },
+                        ))
+                    })
+                    .collect();
+                body.push(segments(modes).into_any_element());
+            }
+            Some(DecodeConfig::Uart { input, baud, .. }) => {
+                body.push(input_row("uart-in", input, cx, &[Input::Ch1, Input::Ch2]));
+                body.push(self.stepper(
+                    "uart-baud",
+                    "Baud",
+                    rate_label(baud, detected, "Bd"),
+                    Box::new(move |this, cx| {
+                        this.update_decoder(
+                            |c| {
+                                if let DecodeConfig::Uart { baud, .. } = c {
+                                    *baud = step_rate(*baud, &STANDARD_BAUDS, -1)
+                                }
+                            },
+                            cx,
+                        )
+                    }),
+                    Box::new(move |this, cx| {
+                        this.update_decoder(
+                            |c| {
+                                if let DecodeConfig::Uart { baud, .. } = c {
+                                    *baud = step_rate(*baud, &STANDARD_BAUDS, 1)
+                                }
+                            },
+                            cx,
+                        )
+                    }),
+                    cx,
+                ));
+            }
+            None => {
+                body.push(caption("Turns the scope into a 2-channel logic analyzer. Decodes the 10k-sample memory of every frame.").into_any_element());
+            }
+        }
+        if let Some(decoded) = &self.decoded {
+            body.push(
+                caption(decoded.summary.clone())
+                    .text_color(theme::text())
+                    .into_any_element(),
+            );
+            if let Some(warning) = decoded.warnings.first() {
+                body.push(
+                    caption(warning.clone())
+                        .text_color(theme::trigger())
+                        .into_any_element(),
+                );
+            }
+            // Offer the timebase that gives ~10 samples per bit when the current one is too slow.
+            let rate = decoded.rate_hz.or(match &self.decoder {
+                Some(DecodeConfig::Can { bitrate, .. }) => *bitrate,
+                Some(DecodeConfig::Uart { baud, .. }) => *baud,
+                _ => None,
+            });
+            if let Some(rate) = rate
+                && decoded.samples_per_bit.is_none_or(|s| s < 6.0)
+            {
+                let target = recommended_timebase(rate, 10.0);
+                if (target - settings.timebase_s_per_div).abs() > target * 1e-6 {
+                    body.push(
+                        button(
+                            "dec-timebase",
+                            format!("Use {}/div", format_si(target, "s")),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.change(vec![Change::Timebase { s_per_div: target }], cx)
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
+        }
+        card("Decode", theme::agent(), None, body)
+    }
+}
+
+/// The decoded events of the newest frame, below the measurements.
+fn decoded_table(decoded: &Decoded) -> AnyElement {
+    let rows: Vec<AnyElement> = decoded
+        .events
+        .iter()
+        .take(400)
+        .map(|event| {
+            let t = event.t_s();
+            div()
+                .flex()
+                .gap(px(14.0))
+                .child(
+                    mono(format!(
+                        "{}{}",
+                        if t >= 0.0 { "+" } else { "" },
+                        format_si(t, "s")
+                    ))
+                    .w(px(96.0))
+                    .text_color(theme::faint()),
+                )
+                .child(mono(event.describe()).text_color(if event.is_ok() {
+                    theme::text()
+                } else {
+                    theme::stop()
+                }))
+                .into_any_element()
+        })
+        .collect();
+    let empty = rows
+        .is_empty()
+        .then(|| caption("Nothing decoded in this frame.").into_any_element());
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .pt(px(4.0))
+        .border_t_1()
+        .border_color(theme::border())
+        .child(
+            div()
+                .flex()
+                .gap(px(10.0))
+                .items_baseline()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::agent())
+                        .child(decoded.protocol.clone()),
+                )
+                .child(caption(format!("{} · {}", decoded.summary, decoded.detail))),
+        )
+        .child(
+            div()
+                .id("decoded-rows")
+                .max_h(px(132.0))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .children(empty)
+                .children(rows),
+        )
+        .into_any_element()
 }

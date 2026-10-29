@@ -140,7 +140,13 @@ pub(crate) fn start() -> (
 
     thread::Builder::new()
         .name("scopewerk-scope".into())
-        .spawn(move || Worker::new(jobs_rx, events_tx).run())
+        .spawn(move || {
+            if std::env::var_os("SCOPEWERK_DEMO").is_some_and(|v| !v.is_empty()) {
+                run_demo(&jobs_rx, &events_tx);
+            } else {
+                Worker::new(jobs_rx, events_tx).run();
+            }
+        })
         .expect("spawning the scope thread");
     (handle, events_rx, broker)
 }
@@ -383,4 +389,42 @@ fn save_screenshot(bytes: &[u8], events: &async_channel::Sender<Event>) {
         },
     };
     let _ = events.send_blocking(event);
+}
+
+/// `SCOPEWERK_DEMO=1`: no USB, a simulated fault-tolerant CAN bus instead (CAN_H on CH1,
+/// CAN_L on CH2). Controls and agents get a friendly refusal.
+fn run_demo(jobs: &Receiver<Job>, events: &async_channel::Sender<Event>) {
+    let send = |event| {
+        let _ = events.send_blocking(event);
+    };
+    send(Event::Connected(Identity {
+        manufacturer: "DEMO".into(),
+        model: "DOS1102".into(),
+        serial: "simulated CAN bus".into(),
+        firmware: "—".into(),
+    }));
+    let mut frame = 0u32;
+    loop {
+        match jobs.recv_timeout(Duration::from_millis(650)) {
+            Ok(Job::Request {
+                reply: Some(reply), ..
+            }) => {
+                let _ = reply.send(Err(
+                    "Scopewerk runs in demo mode (SCOPEWERK_DEMO); there is no scope".into(),
+                ));
+            }
+            Ok(Job::Changes { .. } | Job::Request { .. }) => send(Event::Notice {
+                text: "Demo mode: the scope is simulated, settings do not change".into(),
+                error: false,
+            }),
+            Ok(Job::Live(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        frame += 1;
+        let capture = scopewerk_core::decode::demo::can_capture(frame);
+        send(Event::Frame {
+            capture: Box::new(capture),
+            job_seq: u64::MAX,
+        });
+    }
 }

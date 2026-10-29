@@ -173,15 +173,21 @@ impl Transport {
     }
 
     /// Send one command and return the complete reply (empty for set commands). A pipe error
-    /// gets one retry after [`Self::clear`]; if that fails too the scope is reset on the bus
+    /// or timeout gets one retry after [`Self::clear`]; if that fails too the scope is reset on the bus
     /// (it re-enumerates) and the caller sees [`Error::Disconnected`] and reconnects.
     pub(crate) fn query(&mut self, command: &str) -> Result<Vec<u8>, Error> {
         let started = std::time::Instant::now();
         let mut reply = self.query_once(command);
-        if matches!(reply, Err(Error::Transfer(_) | Error::OutOfSync)) {
+        let stuck = |reply: &Result<Vec<u8>, Error>| {
+            matches!(
+                reply,
+                Err(Error::Transfer(_) | Error::OutOfSync | Error::Timeout)
+            )
+        };
+        if stuck(&reply) {
             self.clear();
             reply = self.query_once(command);
-            if matches!(reply, Err(Error::Transfer(_) | Error::OutOfSync)) {
+            if stuck(&reply) {
                 let _ = self.device.reset().wait();
                 reply = Err(Error::Disconnected);
             }

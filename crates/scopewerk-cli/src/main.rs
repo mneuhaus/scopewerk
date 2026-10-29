@@ -2,6 +2,7 @@
 //! Goes through the running Scopewerk app when there is one, otherwise straight over USB.
 
 mod changes;
+mod decode_cmd;
 mod mcp;
 mod report;
 
@@ -20,7 +21,7 @@ use serde_json::json;
     name = "scopewerk",
     version,
     about = "Hanmatek DOS1102 oscilloscope over USB: capture, configure, export, and an MCP server for agents",
-    after_help = "Examples:\n  scopewerk status\n  scopewerk set timebase=1ms ch1.scale=500mV ch1.offset=-2 trigger.level=1.2V\n  scopewerk capture --memory --csv bus.csv --png bus.png\n  scopewerk single --timeout 30 --csv event.csv\n  scopewerk watch 60 --log levels.jsonl\n  scopewerk mcp            (for Claude Code: claude mcp add scopewerk -- scopewerk mcp)"
+    after_help = "Examples:\n  scopewerk status\n  scopewerk set timebase=1ms ch1.scale=500mV ch1.offset=-2 trigger.level=1.2V\n  scopewerk capture --memory --csv bus.csv --png bus.png\n  scopewerk single --timeout 30 --csv event.csv\n  scopewerk watch 60 --log levels.jsonl\n  scopewerk decode can --input ch1-ch2 --single 10\n  scopewerk mcp            (for Claude Code: claude mcp add scopewerk -- scopewerk mcp)"
 )]
 struct Cli {
     /// Machine-readable JSON instead of text.
@@ -79,6 +80,9 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
     },
+    /// Decode a bus like a logic analyzer: CAN, I²C, SPI or UART.
+    #[command(subcommand)]
+    Decode(decode_cmd::Protocol),
     /// Send raw SCPI commands and print the replies.
     Scpi {
         #[arg(required = true)]
@@ -293,6 +297,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Watch { seconds, log } => watch(seconds, log, json),
+        Command::Decode(protocol) => decode_cmd::run(protocol, json),
         Command::Scpi { commands } => {
             let mut session = session()?;
             for command in commands {

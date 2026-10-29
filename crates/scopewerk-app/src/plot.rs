@@ -9,6 +9,7 @@ use gpui_kit::{
     App, Bounds, ContentMask, Hsla, IntoElement, PathBuilder, Pixels, SharedString, Styled as _,
     TextAlign, TextRun, Window, canvas, fill, font, point, px, size,
 };
+use scopewerk_core::decode::{Annotation, Mark};
 use scopewerk_core::header::{HORIZONTAL_DIVS, VERTICAL_DIVS};
 use scopewerk_core::{Capture, Settings};
 
@@ -18,18 +19,24 @@ use crate::theme;
 const MARGIN_SIDE: f32 = 22.0;
 const MARGIN_TOP: f32 = 18.0;
 const MARGIN_BOTTOM: f32 = 6.0;
+/// The protocol lane under the screen while a decoder runs.
+const LANE_HEIGHT: f32 = 24.0;
+const LANE_GAP: f32 = 8.0;
 
 /// Where the screen sits inside the plot area, in square divisions.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Geometry {
     pub(crate) screen: Bounds<Pixels>,
     pub(crate) div: f32,
+    /// The decoder lane, when shown.
+    pub(crate) lane: Option<Bounds<Pixels>>,
 }
 
 impl Geometry {
-    pub(crate) fn new(bounds: Bounds<Pixels>) -> Self {
+    pub(crate) fn new(bounds: Bounds<Pixels>, lane: bool) -> Self {
+        let lane_room = if lane { LANE_HEIGHT + LANE_GAP } else { 0.0 };
         let width = f32::from(bounds.size.width) - 2.0 * MARGIN_SIDE;
-        let height = f32::from(bounds.size.height) - MARGIN_TOP - MARGIN_BOTTOM;
+        let height = f32::from(bounds.size.height) - MARGIN_TOP - MARGIN_BOTTOM - lane_room;
         let div = (width / to_f32(HORIZONTAL_DIVS))
             .min(height / to_f32(VERTICAL_DIVS))
             .max(4.0)
@@ -38,9 +45,16 @@ impl Geometry {
         let screen_h = div * to_f32(VERTICAL_DIVS);
         let left = f32::from(bounds.origin.x) + (f32::from(bounds.size.width) - screen_w) / 2.0;
         let top = f32::from(bounds.origin.y) + MARGIN_TOP + (height - screen_h).max(0.0) / 2.0;
+        let lane = lane.then(|| {
+            Bounds::new(
+                point(px(left), px(top + screen_h + LANE_GAP)),
+                size(px(screen_w), px(LANE_HEIGHT)),
+            )
+        });
         Self {
             screen: Bounds::new(point(px(left), px(top)), size(px(screen_w), px(screen_h))),
             div,
+            lane,
         }
     }
 
@@ -117,13 +131,16 @@ pub(crate) struct Scene {
     pub(crate) hover_x_div: Option<f64>,
     pub(crate) cursors: [Option<f64>; 2],
     pub(crate) afterglow: bool,
+    /// Decoder annotations of the newest frame; `Some` shows the lane.
+    pub(crate) annotations: Option<Arc<Vec<Annotation>>>,
 }
 
 /// The plot element. `geometry` receives the layout so mouse handlers can map positions.
 pub(crate) fn plot(scene: Scene, geometry: Rc<Cell<Option<Geometry>>>) -> impl IntoElement {
+    let scene_has_lane = scene.annotations.is_some();
     canvas(
         move |bounds, _, _| {
-            let g = Geometry::new(bounds);
+            let g = Geometry::new(bounds, scene_has_lane);
             geometry.set(Some(g));
             g
         },
@@ -212,6 +229,11 @@ fn paint(scene: &Scene, g: Geometry, window: &mut Window, cx: &mut App) {
 
     if let Some(settings) = &scene.settings {
         paint_markers(scene, settings, g, window, cx);
+    }
+    if let (Some(lane), Some(notes), Some(frame)) =
+        (g.lane, scene.annotations.as_ref(), scene.frames.last())
+    {
+        paint_lane(lane, notes, &frame.settings, g, window, cx);
     }
 }
 
@@ -530,4 +552,156 @@ fn label(
         window,
         cx,
     );
+}
+
+fn mark_color(mark: Mark) -> Hsla {
+    match mark {
+        Mark::Start | Mark::Stop => theme::run(),
+        Mark::Address => theme::accent(),
+        Mark::Data => theme::hsla(gpui_kit::rgb(0x8a6cff)),
+        Mark::Control => theme::faint(),
+        Mark::Crc => theme::hsla(gpui_kit::rgb(0x2f9d80)),
+        Mark::Ack => theme::run(),
+        Mark::Nack | Mark::Error => theme::stop(),
+    }
+}
+
+/// Labelled boxes under the screen, aligned with the traces, like a logic analyzer.
+fn paint_lane(
+    lane: Bounds<Pixels>,
+    notes: &[Annotation],
+    settings: &Settings,
+    g: Geometry,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.paint_quad(gpui_kit::quad(
+        lane,
+        px(4.0),
+        theme::panel(),
+        px(1.0),
+        theme::border(),
+        gpui_kit::BorderStyle::Solid,
+    ));
+    let (left, right) = (f32::from(lane.left()), f32::from(lane.right()));
+    let (top, height) = (
+        f32::from(lane.top()) + 3.0,
+        f32::from(lane.size.height) - 6.0,
+    );
+    window.with_content_mask(Some(ContentMask { bounds: lane }), |window| {
+        for note in notes {
+            let x0 = g.x(x_div_of(note.start_s, settings));
+            let x1 = g.x(x_div_of(note.end_s, settings));
+            if x1 < left || x0 > right {
+                continue;
+            }
+            let color = mark_color(note.mark);
+            if x1 - x0 < 3.0 {
+                // A point event (I²C START/STOP/ACK): a narrow tick with its letter.
+                let tick = Bounds::new(point(px(x0 - 1.0), px(top)), size(px(2.0), px(height)));
+                window.paint_quad(fill(tick, color));
+                // Only one-letter marks (I²C S, P, A, N) get a label beside the tick.
+                if note.text.chars().count() == 1 {
+                    label_fit(window, cx, &note.text, x0 + 3.0, top + 2.0, 20.0, color);
+                }
+                continue;
+            }
+            let bounds = Bounds::new(
+                point(px(x0 + 0.5), px(top)),
+                size(px(x1 - x0 - 1.0), px(height)),
+            );
+            window.paint_quad(gpui_kit::quad(
+                bounds,
+                px(3.0),
+                theme::with_alpha(color, 0.22),
+                px(1.0),
+                theme::with_alpha(color, 0.8),
+                gpui_kit::BorderStyle::Solid,
+            ));
+            label_fit(
+                window,
+                cx,
+                &note.text,
+                x0 + 4.0,
+                top + 2.0,
+                x1 - x0 - 8.0,
+                theme::text(),
+            );
+        }
+    });
+}
+
+/// Paint `text` if it fits into `max_width`; else without its first word ("ID 7B3" → "7B3"), else
+/// a shorter prefix with an ellipsis, else nothing.
+fn label_fit(
+    window: &mut Window,
+    cx: &mut App,
+    text: &str,
+    x: f32,
+    top: f32,
+    max_width: f32,
+    color: Hsla,
+) {
+    if max_width < 6.0 {
+        return;
+    }
+    let shape = |window: &mut Window, text: &str| {
+        let text = SharedString::from(text.to_owned());
+        let run = TextRun {
+            len: text.len(),
+            font: font(theme::MONO),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(text, px(10.5), &[run], None)
+    };
+    // Shorter forms in order: without the first word ("ID 7B3 R" → "7B3 R"), or the initial of a
+    // single word ("ACK" → "A"); the last one is truncated with an ellipsis if still too long.
+    let mut forms = vec![text.to_owned()];
+    match text.split_once(' ') {
+        Some((_, rest)) => forms.push(rest.to_owned()),
+        None => forms.extend(text.chars().next().map(String::from)),
+    }
+    for form in &forms[..forms.len() - 1] {
+        let line = shape(window, form);
+        if f32::from(line.width) <= max_width {
+            let _ = line.paint(
+                point(px(x), px(top)),
+                px(14.0),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+    }
+    let mut candidate = forms[forms.len() - 1].clone();
+    loop {
+        let line = shape(window, &candidate);
+        if f32::from(line.width) <= max_width {
+            let _ = line.paint(
+                point(px(x), px(top)),
+                px(14.0),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+        let keep = candidate
+            .trim_end_matches('…')
+            .chars()
+            .count()
+            .saturating_sub(1);
+        if keep < 1 {
+            return;
+        }
+        candidate = candidate.chars().take(keep).collect::<String>() + "…";
+    }
 }

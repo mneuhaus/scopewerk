@@ -13,6 +13,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::control::{Action, ApplyReport, Change};
+use crate::decode::{self, DecodeConfig, Decoded};
 use crate::header::Settings;
 use crate::scope::{Identity, Scope};
 use crate::waveform::Capture;
@@ -49,6 +50,19 @@ pub enum Request {
     Scpi {
         command: String,
     },
+    /// Capture and decode a bus (CAN, I²C, SPI, UART). With `single_timeout_ms` the scope is
+    /// armed for one acquisition first and the decode waits for the trigger.
+    Decode {
+        config: DecodeConfig,
+        #[serde(default = "yes")]
+        memory: bool,
+        #[serde(default)]
+        single_timeout_ms: Option<u64>,
+    },
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Request {
@@ -70,6 +84,19 @@ impl Request {
             Self::Screenshot => "screenshot".into(),
             Self::ScopeMeasurements { channel } => format!("measure CH{channel}"),
             Self::Scpi { command } => format!("SCPI {command}"),
+            Self::Decode {
+                config,
+                single_timeout_ms,
+                ..
+            } => format!(
+                "decode {}{}",
+                config.protocol(),
+                if single_timeout_ms.is_some() {
+                    " (single shot)"
+                } else {
+                    ""
+                }
+            ),
         }
     }
 
@@ -77,7 +104,14 @@ impl Request {
     pub fn changes_scope(&self) -> bool {
         matches!(
             self,
-            Self::Apply { .. } | Self::Act { .. } | Self::SingleShot { .. } | Self::Scpi { .. }
+            Self::Apply { .. }
+                | Self::Act { .. }
+                | Self::SingleShot { .. }
+                | Self::Scpi { .. }
+                | Self::Decode {
+                    single_timeout_ms: Some(_),
+                    ..
+                }
         )
     }
 }
@@ -116,6 +150,15 @@ pub enum Reply {
     Png(#[serde(with = "base64_bytes")] Vec<u8>),
     Json(serde_json::Value),
     Text(String),
+    /// `None` when a single shot did not trigger in time.
+    Decoded(Option<Box<DecodeReply>>),
+}
+
+/// A decode together with the capture it came from (for plots and exports).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeReply {
+    pub decoded: Decoded,
+    pub capture: Capture,
 }
 
 /// Run one request against a scope this process owns.
@@ -146,6 +189,35 @@ pub fn handle(scope: &mut Scope, request: &Request) -> Result<Reply, Error> {
         Request::Screenshot => Reply::Png(image::bmp_to_png(&scope.screenshot_bmp()?)?),
         Request::ScopeMeasurements { channel } => Reply::Json(scope.scope_measurements(*channel)?),
         Request::Scpi { command } => Reply::Text(scope.scpi(command)?),
+        Request::Decode {
+            config,
+            memory,
+            single_timeout_ms,
+        } => {
+            let channels = config.channels();
+            let settings = scope.settings()?;
+            if let Some(off) = channels
+                .iter()
+                .find(|n| settings.channel(**n).is_some_and(|c| !c.enabled))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "CH{off} is switched off but the {} decoder needs it; switch it on first",
+                    config.protocol()
+                )));
+            }
+            let capture = match single_timeout_ms {
+                Some(ms) => scope.single_shot(&channels, *memory, Duration::from_millis(*ms))?,
+                None if *memory => Some(scope.capture_memory(&channels)?),
+                None => Some(scope.capture(&channels)?),
+            };
+            match capture {
+                Some(capture) => {
+                    let decoded = decode::decode(&capture, config)?;
+                    Reply::Decoded(Some(Box::new(DecodeReply { decoded, capture })))
+                }
+                None => Reply::Decoded(None),
+            }
+        }
     })
 }
 

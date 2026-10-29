@@ -12,7 +12,7 @@ use scopewerk_core::{Action, Capture, Reply, Request, Session};
 use serde_json::{Value, json};
 
 use crate::changes;
-use crate::report::{capture_json, settings_json, sig, stats_json};
+use crate::report::{capture_json, decoded_json, settings_json, sig, stats_json};
 
 const INSTRUCTIONS: &str = "Scopewerk drives a Hanmatek DOS1102 two-channel 110 MHz oscilloscope over USB. \
 Start with scope_status. The screen is 15.2 divisions wide (time 0 = trigger point at the centre) and 8 \
@@ -20,7 +20,7 @@ divisions high; a channel shows offset_div ± 4 divisions times volts_per_div. V
 Typical loop: configure_scope (timebase, V/div, offset, trigger) → capture_waveform (numbers + plot) → adjust. \
 Every change is read back from the scope and reported; values snap to the scope's 1-2-5 steps. \
 capture_waveform warns about clipping or a too-coarse V/div. For one-off events use single_shot. \
-scope_screenshot shows the scope's real display.";
+scope_screenshot shows the scope's real display. decode_bus turns it into a logic analyzer for CAN, I2C, SPI and UART.";
 
 pub(crate) fn serve() -> Result<()> {
     let stdin = std::io::stdin();
@@ -244,6 +244,35 @@ fn tools() -> Value {
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         },
+        {
+            "name": "decode_bus",
+            "title": "Decode bus (logic analyzer)",
+            "description": "Capture and decode a serial bus like a logic analyzer: CAN (CRC + ACK checked, bitrate and polarity auto-detected), I2C (SCL+SDA), SPI (clock + one data line, words split at clock pauses) or UART (auto baud). Decodes the 10 000-sample memory by default. Needs about 10 samples per bit: the scope samples 500 points per division, so timebase ≤ 50 / bitrate (e.g. 200us for 125 kbit/s CAN); warnings name the timebase to use. Set single_shot_s to arm the trigger (configure it on the bus first, e.g. falling edge on CAN_L) and decode the next burst. Returns detected parameters, events with hex payloads and times from the trigger, warnings, and a plot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "protocol": {"type": "string", "enum": ["can", "i2c", "spi", "uart"]},
+                    "input": {"type": "string", "enum": ["ch1", "ch2", "ch1-ch2", "ch2-ch1"], "description": "CAN/UART signal; ch1-ch2 = differential (CAN_H on CH1, CAN_L on CH2). Default ch1."},
+                    "bitrate": quantity_schema("CAN bitrate or UART baud, e.g. \"125k\" or 115200; omit to detect"),
+                    "polarity": {"type": "string", "enum": ["auto", "high", "low"], "description": "CAN: high = CAN_H or differential, low = CAN_L or transceiver RX pin"},
+                    "scl": {"type": "integer", "enum": [1, 2], "default": 1},
+                    "sda": {"type": "integer", "enum": [1, 2], "default": 2},
+                    "clk": {"type": "integer", "enum": [1, 2], "default": 1},
+                    "data": {"type": "integer", "enum": [1, 2], "default": 2},
+                    "spi_mode": {"type": "integer", "enum": [0, 1, 2, 3]},
+                    "bits": {"type": "integer", "minimum": 5, "maximum": 32, "description": "SPI word / UART data bits (default 8)"},
+                    "parity": {"type": "string", "enum": ["none", "even", "odd"]},
+                    "single_shot_s": {"type": "number", "maximum": 300, "description": "Arm one acquisition and wait up to this long for the trigger"},
+                    "source": {"type": "string", "enum": ["memory", "screen"], "default": "memory"},
+                    "max_events": {"type": "integer", "default": 100, "maximum": 2000},
+                    "plot": {"type": "boolean", "default": true},
+                    "csv_path": {"type": "string"},
+                },
+                "required": ["protocol"],
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
+        },
     ])
 }
 
@@ -382,6 +411,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Vec<Value>> {
             };
             Ok(vec![text(&value)])
         }
+        "decode_bus" => decode_bus(&mut session, args),
         "send_scpi" => {
             let command = args
                 .get("command")
@@ -494,4 +524,113 @@ fn monitor(session: &mut Session, args: &Value) -> Result<Vec<Value>> {
         reads.push(entry);
     }
     Ok(vec![text(&json!({"reads": reads.len(), "series": reads}))])
+}
+
+fn decode_bus(session: &mut Session, args: &Value) -> Result<Vec<Value>> {
+    use scopewerk_core::decode::Parity;
+    use scopewerk_core::{DecodeConfig, Input};
+
+    let arg = |key: &str| args.get(key).and_then(Value::as_str);
+    let channel = |key: &str, default: u8| -> Result<u8> {
+        match args.get(key).and_then(Value::as_u64) {
+            None => Ok(default),
+            Some(n @ 1..=2) => Ok(u8::try_from(n)?),
+            Some(n) => bail!("{key} must be 1 or 2, got {n}"),
+        }
+    };
+    let input = || -> Result<Input> { Ok(arg("input").unwrap_or("ch1").parse::<Input>()?) };
+    let rate = match args.get("bitrate") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => Some(changes::quantity(
+            s.trim_end_matches("bps").trim_end_matches("bit/s"),
+            "bit/s",
+        )?),
+        Some(other) => bail!("bitrate {other} (e.g. \"125k\" or 115200)"),
+    };
+    let bits = args
+        .get("bits")
+        .and_then(Value::as_u64)
+        .map_or(Ok(8), u8::try_from)?;
+    let config = match arg("protocol").unwrap_or_default() {
+        "can" => DecodeConfig::Can {
+            input: input()?,
+            bitrate: rate,
+            dominant_high: match arg("polarity").unwrap_or("auto") {
+                "auto" => None,
+                "high" => Some(true),
+                "low" => Some(false),
+                other => bail!("polarity {other:?} (auto, high or low)"),
+            },
+        },
+        "i2c" => DecodeConfig::I2c {
+            scl: channel("scl", 1)?,
+            sda: channel("sda", 2)?,
+        },
+        "spi" => DecodeConfig::Spi {
+            clk: channel("clk", 1)?,
+            data: channel("data", 2)?,
+            mode: args
+                .get("spi_mode")
+                .and_then(Value::as_u64)
+                .map(u8::try_from)
+                .transpose()?,
+            bits,
+            lsb_first: false,
+        },
+        "uart" => DecodeConfig::Uart {
+            input: input()?,
+            baud: rate,
+            data_bits: bits,
+            parity: match arg("parity").unwrap_or("none") {
+                "none" => Parity::None,
+                "even" => Parity::Even,
+                "odd" => Parity::Odd,
+                other => bail!("parity {other:?}"),
+            },
+            inverted: false,
+        },
+        other => bail!("protocol {other:?} (can, i2c, spi or uart)"),
+    };
+    let single_timeout_ms = args
+        .get("single_shot_s")
+        .and_then(Value::as_f64)
+        .map(|s| duration_ms(s.clamp(0.5, 300.0)));
+    let memory = arg("source") != Some("screen");
+    let Reply::Decoded(reply) = ask(
+        session,
+        Request::Decode {
+            config,
+            memory,
+            single_timeout_ms,
+        },
+    )?
+    else {
+        bail!("unexpected reply")
+    };
+    let Some(reply) = reply else {
+        return Ok(vec![text(&json!({
+            "triggered": false,
+            "note": "no trigger in time; the scope is still armed. Put the trigger on the bus (e.g. CH with CAN_L, falling edge, level mid-swing, sweep normal) and try again.",
+        }))]);
+    };
+    let limit = args
+        .get("max_events")
+        .and_then(Value::as_u64)
+        .map_or(100, |n| usize::try_from(n.min(2000)).unwrap_or(100));
+    let mut report = decoded_json(&reply.decoded, limit);
+    report["capture"] = json!({
+        "settings": settings_json(&reply.capture.settings),
+        "points": reply.capture.points(),
+        "dt_s": sig(reply.capture.dt, 4),
+    });
+    if let Some(path) = arg("csv_path") {
+        std::fs::write(path, reply.capture.to_csv()).with_context(|| format!("writing {path}"))?;
+        report["csv_path"] = json!(path);
+    }
+    let mut content = vec![text(&report)];
+    if args.get("plot").and_then(Value::as_bool).unwrap_or(true) {
+        content.push(png(&plot_png(&reply.capture, 960, 505)?));
+    }
+    Ok(content)
 }

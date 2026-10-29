@@ -238,6 +238,76 @@ pub(crate) fn settings_line(settings: &Settings) -> String {
     )
 }
 
+/// A decode for agents: summary, detected parameters, warnings, and events with hex payloads.
+pub(crate) fn decoded_json(decoded: &scopewerk_core::Decoded, limit: usize) -> Value {
+    let events: Vec<Value> = decoded
+        .events
+        .iter()
+        .take(limit)
+        .map(|event| {
+            let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
+            if let Some(map) = value.as_object_mut() {
+                for key in ["t_s", "end_s"] {
+                    if let Some(t) = map.get(key).and_then(Value::as_f64) {
+                        map.insert(key.into(), sig(t, 6));
+                    }
+                }
+                if let Some(bytes) = map.get("data").and_then(Value::as_array) {
+                    let hex: Vec<String> = bytes
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(|b| format!("{b:02X}"))
+                        .collect();
+                    map.insert("data".into(), json!(hex.join(" ")));
+                }
+                if let Some(words) = map.get("words").and_then(Value::as_array) {
+                    let hex: Vec<String> = words
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(|w| format!("{w:02X}"))
+                        .collect();
+                    map.insert("words".into(), json!(hex.join(" ")));
+                }
+                if map.get("type").and_then(Value::as_str) == Some("can_frame")
+                    && let Some(id) = map.get("id").and_then(Value::as_u64)
+                {
+                    let extended = map
+                        .get("extended")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    map.insert(
+                        "id".into(),
+                        json!(if extended {
+                            format!("0x{id:08X}")
+                        } else {
+                            format!("0x{id:03X}")
+                        }),
+                    );
+                }
+                if let Some(address) = map.get("address").and_then(Value::as_u64) {
+                    map.insert("address".into(), json!(format!("0x{address:02X}")));
+                }
+                map.insert("text".into(), json!(event.describe()));
+            }
+            value
+        })
+        .collect();
+    json!({
+        "protocol": decoded.protocol,
+        "summary": decoded.summary,
+        "detected": {
+            "rate_hz": decoded.rate_hz.map(|r| sig(r, 5)),
+            "samples_per_bit": decoded.samples_per_bit.map(|s| sig(s, 3)),
+            "detail": decoded.detail,
+            "thresholds_v": decoded.thresholds_v.iter().map(|(ch, v)| json!({"channel": ch, "volts": sig(*v, 3)})).collect::<Vec<_>>(),
+        },
+        "events": events,
+        "events_total": decoded.events.len(),
+        "warnings": decoded.warnings,
+        "time_note": "t_s is seconds from the trigger point",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

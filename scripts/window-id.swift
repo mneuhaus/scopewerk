@@ -5,7 +5,7 @@ import Foundation
 let owner = CommandLine.arguments.dropFirst().first ?? "scopewerk-app"
 let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
 for window in windows where (window[kCGWindowOwnerName as String] as? String) == owner {
-    if let layer = window[kCGWindowLayer as String] as? Int, layer == 0, let id = window[kCGWindowNumber as String] as? Int {
+    if let id = window[kCGWindowNumber as String] as? Int, let bounds = window[kCGWindowBounds as String] as? [String: Any], (bounds["Width"] as? Double ?? 0) > 200 {
         print(id)
         exit(0)
     }

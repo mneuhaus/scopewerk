@@ -1,8 +1,9 @@
 //! Scopewerk: the Hanmatek DOS1102 as a native app. Live screen, controls, measurements,
 //! export, and a broker so agents (`scopewerk mcp`) and the CLI work through this window.
 //!
-//! `SCOPEWERK_BACKGROUND=1` opens the window without taking focus (for scripted screenshots:
-//! typing elsewhere then never reaches the scope's shortcuts).
+//! `SCOPEWERK_BACKGROUND=1` opens a floating window without taking focus (for scripted
+//! screenshots: typing elsewhere never reaches the shortcuts, and the window keeps rendering).
+//! `SCOPEWERK_DEMO=1` shows a simulated CAN bus instead of a USB scope.
 
 mod plot;
 mod service;
@@ -33,6 +34,17 @@ pub(crate) fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string()
 }
 
+/// `SCOPEWERK_WINDOW=1600x1200` overrides the initial window size (presentations, screenshots).
+fn window_size() -> (f32, f32) {
+    std::env::var("SCOPEWERK_WINDOW")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        })
+        .unwrap_or((1400.0, 900.0))
+}
+
 fn main() {
     let background = std::env::var_os("SCOPEWERK_BACKGROUND").is_some_and(|v| !v.is_empty());
     gpui_kit::application()
@@ -60,7 +72,8 @@ fn main() {
             if let Err(err) = &broker {
                 eprintln!("scopewerk: sharing with the CLI/MCP is off: {err}");
             }
-            let bounds = gpui_kit::Bounds::centered(None, size(px(1400.0), px(900.0)), cx);
+            let (width, height) = window_size();
+            let bounds = gpui_kit::Bounds::centered(None, size(px(width), px(height)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui_kit::TitlebarOptions {
@@ -70,6 +83,12 @@ fn main() {
                 }),
                 window_min_size: Some(size(px(980.0), px(620.0))),
                 focus: !background,
+                // Occluded windows stop rendering; a non-activating pop-up stays visible without focus.
+                kind: if background {
+                    gpui_kit::WindowKind::PopUp
+                } else {
+                    gpui_kit::WindowKind::Normal
+                },
                 app_id: Some("com.neuhaus.scopewerk".into()),
                 ..Default::default()
             };

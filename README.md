@@ -9,6 +9,9 @@ the scope too. Pure Rust over USB (`nusb`): no Python, no libusb, no VISA.
   channel, trigger and acquisition settings, CSV export, screenshots of the scope's own display.
 - **Agents**: `scopewerk mcp` exposes the scope as MCP tools. While the app is open, agents and
   the CLI work *through* it, so you watch every change live and see it in the activity log.
+- **Logic analyzer**: decode CAN (CRC and ACK checked, bitrate and polarity detected, one wire or
+  CH1−CH2 differential), I²C, SPI (clock + one data line) and UART (auto baud) on every frame,
+  with a protocol lane under the traces and a table of decoded events.
 - **Verified changes**: the firmware silently ignores values it does not like. Scopewerk reads
   every change back from the scope and reports what really happened, snapping to the scope's
   1-2-5 steps.
@@ -45,7 +48,34 @@ sticks). The app finds the scope on its own and reconnects when it is unplugged.
 | `⌘⇧S` | save the scope's display as PNG (`~/Pictures/Scopewerk`) |
 | `⌘⇧C` | copy measurements |
 
-`SCOPEWERK_BACKGROUND=1` opens the window without taking focus (for scripted screenshots).
+Environment: `SCOPEWERK_DEMO=1` shows a simulated fault-tolerant CAN bus instead of a USB scope
+(try the decoder without hardware), `SCOPEWERK_BACKGROUND=1` opens a non-activating window that
+never takes keyboard focus (scripted screenshots), `SCOPEWERK_WINDOW=1600x1200` sets the size.
+
+## Logic analyzer
+
+The Decode panel (app), `scopewerk decode …` (CLI) and `decode_bus` (MCP) decode the
+10 000-sample acquisition memory. With two channels the DOS1102 covers:
+
+| Protocol | Wiring | Detected automatically |
+| --- | --- | --- |
+| CAN 2.0A/B | CAN_H, CAN_L or a transceiver RX pin on one channel, or CAN_H/CAN_L on CH1/CH2 (`ch1-ch2`) | bitrate, polarity, threshold; CRC-15, stuffing and ACK are checked |
+| I²C | SCL + SDA | thresholds; START, repeated START, STOP, address + R/W, ACK/NACK |
+| SPI | clock + one data line (no chip select: words split at clock pauses) | CPOL from the idle clock (CPHA 0 unless given) |
+| UART | one line | baud (snapped to standard rates), 8N1 by default |
+
+The scope samples 500 points per division, so the timebase sets the samples per bit. About ten
+are plenty: timebase ≤ 50 / bitrate (200 µs/div for 125 kbit/s CAN, 2 ms/div window). Scopewerk
+warns and offers the right timebase when there are too few. To catch a rare frame, trigger on the
+bus (e.g. CAN_L, falling edge, level mid-swing, sweep Normal) and use single shot.
+
+```sh
+scopewerk decode can --input ch1-ch2               # differential, everything detected
+scopewerk decode can --bitrate 125k --single 10    # arm and wait up to 10 s for a frame
+scopewerk decode i2c --scl 1 --sda 2
+scopewerk decode spi --clk 1 --data 2 --mode 0
+scopewerk decode uart --baud 115200
+```
 
 ## CLI
 
@@ -79,6 +109,7 @@ claude mcp add --scope user scopewerk -- /Applications/Scopewerk.app/Contents/Ma
 | `monitor_levels` | min/mean/max/frequency over time, e.g. while a device powers up |
 | `scope_screenshot` | the scope's real display as PNG |
 | `scope_measurements` | the scope's built-in measurements |
+| `decode_bus` | logic analyzer: CAN, I²C, SPI, UART with detected parameters, events and plot |
 | `send_scpi` | raw SCPI escape hatch |
 
 ## Protocol notes (DOS1102, firmware V1.5.0, USB `5345:1235`)

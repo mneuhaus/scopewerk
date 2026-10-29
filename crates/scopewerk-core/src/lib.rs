@@ -4,6 +4,7 @@
 
 pub mod broker;
 pub mod control;
+pub mod decode;
 pub mod header;
 pub mod image;
 pub mod scope;
@@ -13,6 +14,7 @@ pub mod waveform;
 
 pub use broker::{Reply, Request, Session, Status};
 pub use control::{Acquisition, Action, ApplyReport, Change, Coupling, Edge, Outcome, Sweep};
+pub use decode::{DecodeConfig, Decoded, Input};
 pub use header::{ChannelSettings, ScreenHeader, Settings, TriggerSettings};
 pub use scope::{Identity, Scope};
 pub use waveform::{Capture, Stats, Waveform};
