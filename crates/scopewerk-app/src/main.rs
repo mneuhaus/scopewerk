@@ -21,12 +21,21 @@ use crate::view::ScopeView;
 
 gpui_kit::actions!(scopewerk_app, [Quit, Hide]);
 
-/// `~/<folder>/Scopewerk`, where exports and screenshots go.
-pub(crate) fn export_dir(folder: &str) -> PathBuf {
-    std::env::var_os("HOME")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join(folder)
+/// Where exports and screenshots go: `Scopewerk` inside the user's Documents or Pictures.
+pub(crate) fn export_dir(kind: Folder) -> PathBuf {
+    let base = match kind {
+        Folder::Documents => dirs::document_dir(),
+        Folder::Pictures => dirs::picture_dir(),
+    };
+    base.or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("Scopewerk")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Folder {
+    Documents,
+    Pictures,
 }
 
 /// Local time for file names: `2026-10-29-174210`.
@@ -54,6 +63,8 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-h", Hide, None),
+                KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("alt-f4", Quit, None),
             ]);
             view::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
@@ -78,7 +89,8 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some("Scopewerk".into()),
-                    appears_transparent: true,
+                    // macOS: the toolbar runs under the traffic lights; elsewhere the system title bar stays.
+                    appears_transparent: cfg!(target_os = "macos"),
                     traffic_light_position: Some(point(px(14.0), px(15.0))),
                 }),
                 window_min_size: Some(size(px(980.0), px(620.0))),

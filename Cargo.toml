@@ -3,9 +3,11 @@ resolver = "2"
 members = ["crates/scopewerk-core", "crates/scopewerk-cli", "crates/scopewerk-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/mneuhaus/scopewerk"
+homepage = "https://mneuhaus.github.io/scopewerk/"
 
 [workspace.dependencies]
 scopewerk-core = { path = "crates/scopewerk-core" }

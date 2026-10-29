@@ -207,6 +207,23 @@ pub(crate) fn run(protocol: Protocol, json: bool) -> Result<()> {
         return Ok(());
     }
     println!("{}  ({})", decoded.summary, decoded.detail);
+    if decoded.protocol == "UART" {
+        for (t, bytes) in scopewerk_core::decode::uart_lines(&decoded.events, decoded.rate_hz)
+            .iter()
+            .take(common.limit)
+        {
+            let sign = if *t >= 0.0 { "+" } else { "" };
+            println!(
+                "{:>12}  {}",
+                format!("{sign}{}", format_si(*t, "s")),
+                scopewerk_core::decode::escape_text(bytes)
+            );
+        }
+        for warning in &decoded.warnings {
+            println!("! {warning}");
+        }
+        return Ok(());
+    }
     for event in decoded.events.iter().take(common.limit) {
         let t = event.t_s();
         let sign = if t >= 0.0 { "+" } else { "" };

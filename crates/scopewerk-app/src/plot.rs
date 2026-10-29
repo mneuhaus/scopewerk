@@ -589,7 +589,7 @@ fn paint_lane(
         f32::from(lane.size.height) - 6.0,
     );
     window.with_content_mask(Some(ContentMask { bounds: lane }), |window| {
-        for note in notes {
+        for (index, note) in notes.iter().enumerate() {
             let x0 = g.x(x_div_of(note.start_s, settings));
             let x1 = g.x(x_div_of(note.end_s, settings));
             if x1 < left || x0 > right {
@@ -600,8 +600,12 @@ fn paint_lane(
                 // A point event (I²C START/STOP/ACK): a narrow tick with its letter.
                 let tick = Bounds::new(point(px(x0 - 1.0), px(top)), size(px(2.0), px(height)));
                 window.paint_quad(fill(tick, color));
-                // Only one-letter marks (I²C S, P, A, N) get a label beside the tick.
-                if note.text.chars().count() == 1 {
+                // One-letter marks (I²C S, P, A, N) get their letter when it does not run into the
+                // next annotation; otherwise the tick colour alone tells ACK (green) from NACK (red).
+                let room = notes.get(index + 1).map_or(f32::INFINITY, |next| {
+                    g.x(x_div_of(next.start_s, settings)) - x0
+                });
+                if note.text.chars().count() == 1 && room > 12.0 {
                     label_fit(window, cx, &note.text, x0 + 3.0, top + 2.0, 20.0, color);
                 }
                 continue;

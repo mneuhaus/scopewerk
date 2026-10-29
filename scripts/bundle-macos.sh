@@ -2,7 +2,8 @@
 # Builds a release Scopewerk.app into dist/ (bundle id com.neuhaus.scopewerk, generated icon,
 # ad-hoc signed). The app carries the `scopewerk` CLI / MCP server next to it:
 #   dist/Scopewerk.app/Contents/MacOS/scopewerk mcp
-# Installs nothing; pass --install to copy the app to /Applications.
+# Installs nothing; pass --install to copy the app to /Applications. UNIVERSAL=1 builds Apple
+# Silicon + Intel in one bundle.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,14 +12,25 @@ dist="$root/dist"
 app="$dist/Scopewerk.app"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
 
-echo "building scopewerk $version (release)"
-CARGO_TARGET_DIR="$target_dir" cargo build --release -p scopewerk-app -p scopewerk-cli \
-    --manifest-path "$root/Cargo.toml"
-
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$target_dir/release/scopewerk-app" "$app/Contents/MacOS/scopewerk-app"
-cp "$target_dir/release/scopewerk" "$app/Contents/MacOS/scopewerk"
+if [[ -n "${UNIVERSAL:-}" ]]; then
+    for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+        echo "building scopewerk $version (release, $triple)"
+        CARGO_TARGET_DIR="$target_dir" cargo build --release -p scopewerk-app -p scopewerk-cli \
+            --target "$triple" --manifest-path "$root/Cargo.toml"
+    done
+    for bin in scopewerk-app scopewerk; do
+        lipo -create -output "$app/Contents/MacOS/$bin" \
+            "$target_dir/aarch64-apple-darwin/release/$bin" "$target_dir/x86_64-apple-darwin/release/$bin"
+    done
+else
+    echo "building scopewerk $version (release)"
+    CARGO_TARGET_DIR="$target_dir" cargo build --release -p scopewerk-app -p scopewerk-cli \
+        --manifest-path "$root/Cargo.toml"
+    cp "$target_dir/release/scopewerk-app" "$app/Contents/MacOS/scopewerk-app"
+    cp "$target_dir/release/scopewerk" "$app/Contents/MacOS/scopewerk"
+fi
 
 echo "drawing the icon"
 work="$(mktemp -d "$dist/.icon.XXXXXX")"

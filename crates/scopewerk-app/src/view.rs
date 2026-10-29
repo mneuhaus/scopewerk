@@ -22,7 +22,8 @@ use scopewerk_core::{
 };
 
 use scopewerk_core::decode::{
-    self, DecodeConfig, Decoded, Input, STANDARD_BAUDS, STANDARD_BITRATES, recommended_timebase,
+    self, DecodeConfig, Decoded, Input, STANDARD_BAUDS, STANDARD_BITRATES, demo,
+    recommended_timebase,
 };
 
 use crate::plot::{self, Geometry, Scene, time_of, value_at, x_div_of};
@@ -57,6 +58,22 @@ gpui_kit::actions!(
 );
 
 const CONTEXT: &str = "ScopeView";
+// Modifier names in hints, as each platform prints them.
+const MOD: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "Ctrl+"
+};
+const SHIFT: &str = if cfg!(target_os = "macos") {
+    "⇧"
+} else {
+    "Shift+"
+};
+const ALT: &str = if cfg!(target_os = "macos") {
+    "⌥"
+} else {
+    "Alt"
+};
 const AFTERGLOW_FRAMES: usize = 6;
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 const ACTIVITY_KEEP: usize = 40;
@@ -66,7 +83,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("space", ToggleRun, context),
         KeyBinding::new("s", SingleShot, context),
-        KeyBinding::new("cmd-shift-a", Autoset, context),
+        KeyBinding::new("secondary-shift-a", Autoset, context),
         KeyBinding::new("left", TimebaseFaster, context),
         KeyBinding::new("right", TimebaseSlower, context),
         KeyBinding::new("up", VoltsFiner, context),
@@ -75,16 +92,16 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-down", OffsetDown, context),
         KeyBinding::new("1", SelectCh1, context),
         KeyBinding::new("2", SelectCh2, context),
-        KeyBinding::new("cmd-1", ToggleCh1, context),
-        KeyBinding::new("cmd-2", ToggleCh2, context),
+        KeyBinding::new("secondary-1", ToggleCh1, context),
+        KeyBinding::new("secondary-2", ToggleCh2, context),
         KeyBinding::new("m", ToggleMemory, context),
         KeyBinding::new("g", ToggleAfterglow, context),
         KeyBinding::new("p", TogglePause, context),
         KeyBinding::new("t", TriggerToMiddle, context),
         KeyBinding::new("escape", ClearCursors, context),
-        KeyBinding::new("cmd-e", ExportCsv, context),
-        KeyBinding::new("cmd-shift-s", SaveScreenshot, context),
-        KeyBinding::new("cmd-shift-c", CopyMeasurements, context),
+        KeyBinding::new("secondary-e", ExportCsv, context),
+        KeyBinding::new("secondary-shift-s", SaveScreenshot, context),
+        KeyBinding::new("secondary-shift-c", CopyMeasurements, context),
     ]);
 }
 
@@ -182,14 +199,22 @@ impl ScopeView {
             activity: VecDeque::new(),
             notice: None,
             scroll: 0.0,
-            // The demo bus shows off the CAN decoder right away.
-            decoder: std::env::var_os("SCOPEWERK_DEMO")
-                .is_some_and(|v| !v.is_empty())
-                .then_some(DecodeConfig::Can {
+            // The demo buses show off their decoder right away.
+            decoder: demo::Kind::from_env().map(|kind| match kind {
+                demo::Kind::Can => DecodeConfig::Can {
                     input: Input::Ch1MinusCh2,
                     bitrate: None,
                     dominant_high: None,
-                }),
+                },
+                demo::Kind::I2c => DecodeConfig::I2c { scl: 1, sda: 2 },
+                demo::Kind::Uart => DecodeConfig::Uart {
+                    input: Input::Ch1,
+                    baud: None,
+                    data_bits: 8,
+                    parity: decode::Parity::None,
+                    inverted: false,
+                },
+            }),
             decoded: None,
             memory_before_decode: None,
         }
@@ -423,7 +448,7 @@ impl ScopeView {
         let Some(frame) = self.frames.back().cloned() else {
             return;
         };
-        let directory = crate::export_dir("Documents");
+        let directory = crate::export_dir(crate::Folder::Documents);
         let _ = std::fs::create_dir_all(&directory);
         let name = format!("scope-{}.csv", crate::timestamp());
         let target = cx.prompt_for_new_path(&directory, Some(&name));
@@ -813,7 +838,12 @@ impl ScopeView {
         let state = if stopped { theme::stop() } else { theme::run() };
         div()
             .h(px(44.0))
-            .pl(px(84.0))
+            // macOS: the toolbar runs under the traffic lights.
+            .pl(px(if cfg!(target_os = "macos") {
+                84.0
+            } else {
+                14.0
+            }))
             .pr(px(12.0))
             .flex()
             .items_center()
@@ -1009,7 +1039,7 @@ impl ScopeView {
             }
             rows.push(row);
         } else if self.cursors.iter().any(Option::is_some) {
-            rows.push(div().child(caption("⌥-click sets cursor B · esc clears")));
+            rows.push(div().child(caption(format!("{ALT}-click sets cursor B · esc clears"))));
         }
         let left = self
             .geometry
@@ -1682,11 +1712,11 @@ impl Render for ScopeView {
                                     .border_color(theme::border())
                                     .text_size(px(10.5))
                                     .text_color(theme::faint())
-                                    .child(
-                                        "␣ run/stop   s single   ⌘⇧A autoset   ←→ timebase   ↑↓ V/div   ⇧↑↓ offset   \
-                                         1/2 channel   t 50 %   m memory   g afterglow   scroll timebase (⌥ V/div, ⇧ offset)   \
-                                         click cursor A, ⌥-click B",
-                                    ),
+                                    .child(format!(
+                                        "space run/stop   s single   {MOD}{SHIFT}A autoset   ←→ timebase   ↑↓ V/div   \
+                                         {SHIFT}↑↓ offset   1/2 channel   t 50 %   m memory   g afterglow   \
+                                         scroll timebase ({ALT} V/div, {SHIFT} offset)   click cursor A, {ALT}-click B"
+                                    )),
                             )
                             .children(self.notice()),
                     )
@@ -2039,12 +2069,30 @@ impl ScopeView {
 
 /// The decoded events of the newest frame, below the measurements.
 fn decoded_table(decoded: &Decoded) -> AnyElement {
-    let rows: Vec<AnyElement> = decoded
-        .events
-        .iter()
+    // UART reads better as lines of text than as one row per byte.
+    let entries: Vec<(f64, String, bool)> = if decoded.protocol == "UART" {
+        decode::uart_lines(&decoded.events, decoded.rate_hz)
+            .into_iter()
+            .map(|(t, bytes)| {
+                let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+                (
+                    t,
+                    format!("{:<24} {}", decode::escape_text(&bytes), hex.join(" ")),
+                    true,
+                )
+            })
+            .collect()
+    } else {
+        decoded
+            .events
+            .iter()
+            .map(|e| (e.t_s(), e.describe(), e.is_ok()))
+            .collect()
+    };
+    let rows: Vec<AnyElement> = entries
+        .into_iter()
         .take(400)
-        .map(|event| {
-            let t = event.t_s();
+        .map(|(t, text, ok)| {
             div()
                 .flex()
                 .gap(px(14.0))
@@ -2057,11 +2105,7 @@ fn decoded_table(decoded: &Decoded) -> AnyElement {
                     .w(px(96.0))
                     .text_color(theme::faint()),
                 )
-                .child(mono(event.describe()).text_color(if event.is_ok() {
-                    theme::text()
-                } else {
-                    theme::stop()
-                }))
+                .child(mono(text).text_color(if ok { theme::text() } else { theme::stop() }))
                 .into_any_element()
         })
         .collect();

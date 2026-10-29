@@ -70,4 +70,11 @@ pub(crate) fn with_alpha(color: Hsla, alpha: f32) -> Hsla {
     }
 }
 
-pub(crate) const MONO: &str = "Menlo";
+/// A monospace face every installation of the platform has.
+pub(crate) const MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else if cfg!(target_os = "windows") {
+    "Consolas"
+} else {
+    "DejaVu Sans Mono"
+};

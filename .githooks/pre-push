@@ -1,0 +1,33 @@
+#!/bin/sh
+# Scan every commit about to be pushed (this repo is public): secrets and forbidden files.
+# Enabled per clone with: git config core.hooksPath .githooks
+set -eu
+
+zero=0000000000000000000000000000000000000000
+forbidden='^(tmp|dist|target)/|(^|/)\.env|\.(p12|pem|key|keychain)$|token\.json$|config\.toml$'
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue # deleting a branch
+    if [ "$remote_sha" = "$zero" ]; then
+        range="$local_sha" # new branch: everything it contains
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    bad=$(git log --name-only --format= "$range" | grep -E "$forbidden" | sort -u || true)
+    if [ -n "$bad" ]; then
+        echo "pre-push: these files must not leave this machine:" >&2
+        echo "$bad" | sed 's/^/  /' >&2
+        exit 1
+    fi
+
+    if command -v gitleaks >/dev/null 2>&1; then
+        gitleaks git --log-opts="$range" --redact --no-banner . || {
+            echo "pre-push: gitleaks found a possible secret in $range (see above)" >&2
+            exit 1
+        }
+    else
+        echo "pre-push: gitleaks is not installed (brew install gitleaks); refusing to push unscanned" >&2
+        exit 1
+    fi
+done

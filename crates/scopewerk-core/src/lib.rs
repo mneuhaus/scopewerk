@@ -5,6 +5,7 @@
 pub mod broker;
 pub mod control;
 pub mod decode;
+pub mod endpoint;
 pub mod header;
 pub mod image;
 pub mod scope;
@@ -53,4 +54,10 @@ pub enum Error {
     },
     #[error("broker: {0}")]
     Broker(String),
+    #[error(
+        "Windows has the scope on the \"{0}\" driver, Scopewerk needs WinUSB. Install it once with \
+         Zadig (https://zadig.akeo.ie): Options > List All Devices, pick \"Oscilloscope\" (USB ID 5345 \
+         1235), choose WinUSB, Replace Driver"
+    )]
+    NeedsDriver(String),
 }

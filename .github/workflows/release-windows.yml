@@ -1,0 +1,56 @@
+# Builds the Windows downloads and attaches them to a GitHub release. The macOS downloads are built
+# locally (scripts/release-macos.sh) and uploaded with the release itself.
+name: Windows release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload to (e.g. v1.0.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup update stable --no-self-update; rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p scopewerk-app -p scopewerk-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = $env:TAG.TrimStart("v")
+          # Scopewerk.exe and scopewerk.exe are the same name on Windows: the CLI lives in cli\.
+          New-Item -ItemType Directory -Force dist/Scopewerk/cli, dist/scopewerk-cli | Out-Null
+          Copy-Item target/release/scopewerk-app.exe dist/Scopewerk/Scopewerk.exe
+          Copy-Item target/release/scopewerk.exe dist/Scopewerk/cli/scopewerk.exe
+          Copy-Item target/release/scopewerk.exe dist/scopewerk-cli/scopewerk.exe
+          foreach ($dir in "dist/Scopewerk", "dist/scopewerk-cli") {
+            Copy-Item LICENSE, packaging/windows/README.txt $dir
+          }
+          Compress-Archive -Force dist/Scopewerk "dist/Scopewerk-$v-windows-x64.zip"
+          Compress-Archive -Force dist/scopewerk-cli "dist/scopewerk-cli-$v-windows-x64.zip"
+          Get-ChildItem dist/*.zip | ForEach-Object {
+            "$((Get-FileHash -Algorithm SHA256 $_).Hash.ToLower())  ./$($_.Name)"
+          } | Set-Content -Encoding ascii "dist/SHA256SUMS-$v-windows.txt"
+          Get-Content "dist/SHA256SUMS-$v-windows.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scopewerk-windows
+          path: dist/*.zip
+      - name: Upload to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:TAG (Get-ChildItem dist/*.zip, dist/SHA256SUMS-*.txt).FullName --clobber

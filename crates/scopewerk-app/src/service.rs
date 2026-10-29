@@ -134,15 +134,13 @@ pub(crate) fn start() -> (
             .recv()
             .unwrap_or_else(|_| Err("the Scopewerk app is shutting down".into()))
     });
-    let broker = broker::serve(handler)
-        .map(|path| path.display().to_string())
-        .map_err(|err| err.to_string());
+    let broker = broker::serve(handler).map_err(|err| err.to_string());
 
     thread::Builder::new()
         .name("scopewerk-scope".into())
         .spawn(move || {
-            if std::env::var_os("SCOPEWERK_DEMO").is_some_and(|v| !v.is_empty()) {
-                run_demo(&jobs_rx, &events_tx);
+            if let Some(kind) = scopewerk_core::decode::demo::Kind::from_env() {
+                run_demo(kind, &jobs_rx, &events_tx);
             } else {
                 Worker::new(jobs_rx, events_tx).run();
             }
@@ -375,7 +373,7 @@ fn is_fatal(err: &Error) -> bool {
 
 /// Screenshots requested from the window land in ~/Pictures/Scopewerk.
 fn save_screenshot(bytes: &[u8], events: &async_channel::Sender<Event>) {
-    let dir = crate::export_dir("Pictures");
+    let dir = crate::export_dir(crate::Folder::Pictures);
     let path = dir.join(format!("scope-{}.png", crate::timestamp()));
     let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes));
     let event = match result {
@@ -391,16 +389,20 @@ fn save_screenshot(bytes: &[u8], events: &async_channel::Sender<Event>) {
     let _ = events.send_blocking(event);
 }
 
-/// `SCOPEWERK_DEMO=1`: no USB, a simulated fault-tolerant CAN bus instead (CAN_H on CH1,
-/// CAN_L on CH2). Controls and agents get a friendly refusal.
-fn run_demo(jobs: &Receiver<Job>, events: &async_channel::Sender<Event>) {
+/// `SCOPEWERK_DEMO=can|i2c|uart`: no USB, a simulated bus instead. Controls and agents get a
+/// friendly refusal.
+fn run_demo(
+    kind: scopewerk_core::decode::demo::Kind,
+    jobs: &Receiver<Job>,
+    events: &async_channel::Sender<Event>,
+) {
     let send = |event| {
         let _ = events.send_blocking(event);
     };
     send(Event::Connected(Identity {
         manufacturer: "DEMO".into(),
         model: "DOS1102".into(),
-        serial: "simulated CAN bus".into(),
+        serial: format!("simulated {} bus", kind.label()),
         firmware: "—".into(),
     }));
     let mut frame = 0u32;
@@ -421,7 +423,7 @@ fn run_demo(jobs: &Receiver<Job>, events: &async_channel::Sender<Event>) {
             Err(RecvTimeoutError::Disconnected) => return,
         }
         frame += 1;
-        let capture = scopewerk_core::decode::demo::can_capture(frame);
+        let capture = scopewerk_core::decode::demo::capture_of(kind, frame);
         send(Event::Frame {
             capture: Box::new(capture),
             job_seq: u64::MAX,

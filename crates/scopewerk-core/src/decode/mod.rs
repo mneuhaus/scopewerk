@@ -750,6 +750,24 @@ mod tests {
     }
 
     #[test]
+    fn the_i2c_and_uart_demos_decode() {
+        let i2c =
+            decode(&demo::i2c_capture(1), &DecodeConfig::I2c { scl: 1, sda: 2 }).expect("i2c");
+        let lines: Vec<String> = i2c.events.iter().map(Event::describe).collect();
+        assert_eq!(lines, vec!["0x48 write: 00", "0x48 read: 1A 80"], "{i2c:?}");
+        let config = DecodeConfig::Uart {
+            input: Input::Ch1,
+            baud: None,
+            data_bits: 8,
+            parity: Parity::None,
+            inverted: false,
+        };
+        let uart = decode(&demo::uart_capture(0), &config).expect("uart");
+        assert_eq!(uart.rate_hz, Some(115_200.0));
+        assert!(uart.detail.contains("MEAS:VOLT?"), "{}", uart.detail);
+    }
+
+    #[test]
     fn the_demo_bus_decodes_on_every_input() {
         let capture = demo::can_capture(4);
         for input in [Input::Ch1, Input::Ch2, Input::Ch1MinusCh2] {
@@ -778,14 +796,146 @@ mod tests {
 }
 
 pub mod demo {
-    //! A synthetic two-channel capture of a fault-tolerant CAN bus (CAN_H on CH1, CAN_L on CH2,
-    //! 125 kbit/s, 200 µs/div memory), for trying Scopewerk without a scope.
+    //! Synthetic two-channel captures for trying Scopewerk without a scope (`SCOPEWERK_DEMO`):
+    //! a fault-tolerant CAN bus (CAN_H on CH1, CAN_L on CH2), an I²C sensor read (SCL on CH1, SDA
+    //! on CH2) and a UART conversation (TX on CH1, RX on CH2). Each is a 10 000-sample memory
+    //! read with realistic edges, noise and 8-bit quantization.
 
     use super::can::encode;
     use crate::header::{ChannelSettings, Settings, TriggerSettings};
     use crate::waveform::{Capture, Waveform};
 
-    /// Frame `n` of the demo: a few R-Net-like frames whose data changes with `n`.
+    /// Which bus the demo shows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Can,
+        I2c,
+        Uart,
+    }
+
+    impl Kind {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Can => "CAN",
+                Self::I2c => "I²C",
+                Self::Uart => "UART",
+            }
+        }
+
+        /// From `SCOPEWERK_DEMO`: `i2c`, `uart`, anything else (e.g. `1`) is CAN.
+        pub fn from_env() -> Option<Self> {
+            let value = std::env::var("SCOPEWERK_DEMO")
+                .ok()
+                .filter(|v| !v.is_empty())?;
+            Some(match value.to_ascii_lowercase().as_str() {
+                "i2c" => Self::I2c,
+                "uart" | "serial" => Self::Uart,
+                _ => Self::Can,
+            })
+        }
+    }
+
+    const POINTS: usize = 10_000;
+
+    /// One sample per level, with an RC edge, noise and quantization to 1/25 division.
+    fn render(levels: &[bool], low: f64, high: f64, smoothing: f64, seed: u32) -> Vec<f32> {
+        let step = (high - low).abs() / 50.0;
+        let mut v = if levels.first().copied().unwrap_or(true) {
+            high
+        } else {
+            low
+        };
+        let mut state = seed | 1;
+        levels
+            .iter()
+            .map(|level| {
+                let target = if *level { high } else { low };
+                v += (target - v) * smoothing;
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let noise = (f64::from(state % 1000) / 1000.0 - 0.5) * step * 2.0;
+                (((v + noise) / step).round() * step) as f32
+            })
+            .collect()
+    }
+
+    fn stretch(bits: &[bool], samples_per_bit: f64) -> Vec<bool> {
+        (0..POINTS)
+            .map(|i| {
+                bits.get((i as f64 / samples_per_bit) as usize)
+                    .copied()
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    fn channel(c: u8, volts_per_div: f64, offset_div: f64) -> ChannelSettings {
+        ChannelSettings {
+            channel: c,
+            enabled: true,
+            volts_per_div,
+            offset_div,
+            coupling: "DC".into(),
+            probe: "1X".into(),
+            inverted: false,
+        }
+    }
+
+    fn capture(
+        timebase: f64,
+        channels: Vec<ChannelSettings>,
+        trigger: (&str, f64, &str),
+        waves: [Vec<f32>; 2],
+    ) -> Capture {
+        let rate = 500.0 / timebase;
+        let [ch1, ch2] = waves;
+        Capture {
+            captured_at_ms: 0,
+            settings: Settings {
+                timebase_s_per_div: timebase,
+                horizontal_offset_div: 0.0,
+                sample_rate_sa_s: Some(rate),
+                memory_depth: "10K".into(),
+                acquisition: "SAMPle".into(),
+                run_status: "TRIG".into(),
+                channels,
+                trigger: TriggerSettings {
+                    mode: "SINGle".into(),
+                    kind: "EDGE".into(),
+                    source: trigger.0.into(),
+                    level_v: Some(trigger.1),
+                    edge: trigger.2.into(),
+                    coupling: "DC".into(),
+                    holdoff_s: Some(1e-7),
+                    sweep: "NORMal".into(),
+                },
+            },
+            dt: 1.0 / rate,
+            t0: -(POINTS as f64 / 2.0) / rate,
+            waveforms: vec![
+                Waveform {
+                    channel: 1,
+                    volts: ch1,
+                },
+                Waveform {
+                    channel: 2,
+                    volts: ch2,
+                },
+            ],
+        }
+    }
+
+    /// Frame `n` of the chosen demo; the data changes with `n`.
+    pub fn capture_of(kind: Kind, n: u32) -> Capture {
+        match kind {
+            Kind::Can => can_capture(n),
+            Kind::I2c => i2c_capture(n),
+            Kind::Uart => uart_capture(n),
+        }
+    }
+
+    /// Fault-tolerant CAN at 125 kbit/s, 200 µs/div: R-Net-like frames.
     pub fn can_capture(n: u32) -> Capture {
         let x = (n.wrapping_mul(37) % 200) as u8;
         let frames = [
@@ -799,75 +949,141 @@ pub mod demo {
                 !n.is_multiple_of(3),
             ),
         ];
-        let mut bits = vec![true; 40];
+        // Traffic starts where the screen does (the memory shows 2.4 divisions more on each side).
+        let mut bits = vec![true; 65];
         for frame in &frames {
             bits.extend(frame);
             bits.extend(vec![true; 18]);
         }
-        bits.resize(10_000 / 20 + 1, true);
-        let spb = 20.0; // 2.5 MS/s at 125 kbit/s
-        let render = |dominant_level: f64, recessive_level: f64| -> Vec<f32> {
-            let mut out = Vec::with_capacity(10_000);
-            let mut v = recessive_level;
-            let mut seed = 0x9e37_79b9_u32 ^ n;
-            for i in 0..10_000usize {
-                let recessive = bits[(i as f64 / spb) as usize];
-                let target = if recessive {
-                    recessive_level
-                } else {
-                    dominant_level
-                };
-                v += (target - v) * 0.35;
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                let noise = (f64::from(seed % 1000) / 1000.0 - 0.5) * 0.12;
-                out.push((((v + noise) / 0.04).round() * 0.04) as f32);
-            }
-            out
-        };
-        let channel = |c: u8| ChannelSettings {
-            channel: c,
-            enabled: true,
-            volts_per_div: 2.0,
-            offset_div: if c == 1 { -1.0 } else { -3.0 },
-            coupling: "DC".into(),
-            probe: "1X".into(),
-            inverted: false,
-        };
-        Capture {
-            captured_at_ms: 0,
-            settings: Settings {
-                timebase_s_per_div: 200e-6,
-                horizontal_offset_div: 0.0,
-                sample_rate_sa_s: Some(2.5e6),
-                memory_depth: "10K".into(),
-                acquisition: "SAMPle".into(),
-                run_status: "TRIG".into(),
-                channels: vec![channel(1), channel(2)],
-                trigger: TriggerSettings {
-                    mode: "SINGle".into(),
-                    kind: "EDGE".into(),
-                    source: "CH2".into(),
-                    level_v: Some(3.2),
-                    edge: "FALL".into(),
-                    coupling: "DC".into(),
-                    holdoff_s: Some(1e-7),
-                    sweep: "NORMal".into(),
-                },
-            },
-            dt: 1.0 / 2.5e6,
-            t0: -5000.0 / 2.5e6,
-            waveforms: vec![
-                Waveform {
-                    channel: 1,
-                    volts: render(3.6, 0.0),
-                },
-                Waveform {
-                    channel: 2,
-                    volts: render(1.4, 5.0),
-                },
+        let recessive = stretch(&bits, 20.0);
+        let dominant: Vec<bool> = recessive.iter().map(|r| !r).collect();
+        capture(
+            200e-6,
+            vec![channel(1, 2.0, -1.0), channel(2, 2.0, -3.0)],
+            ("CH2", 3.2, "FALL"),
+            [
+                render(&dominant, 0.0, 3.6, 0.35, n),
+                render(&recessive, 1.4, 5.0, 0.35, n ^ 0x55),
             ],
+        )
+    }
+
+    /// I²C at 100 kHz, 100 µs/div: a temperature sensor at 0x48 read twice.
+    pub fn i2c_capture(n: u32) -> Capture {
+        let half = 25; // 5 µs at 5 MS/s
+        let (mut scl, mut sda) = (Vec::with_capacity(POINTS), Vec::with_capacity(POINTS));
+        let mut put = |c: bool, d: bool, count: usize| {
+            for _ in 0..count {
+                scl.push(c);
+                sda.push(d);
+            }
+        };
+        put(true, true, 1300);
+        let temperature = 0x19 + (n % 4) as u8;
+        for (address, read, payload) in [
+            (0x48u8, false, vec![0x00u8]),
+            (0x48, true, vec![temperature, 0x80]),
+        ] {
+            // START
+            put(true, true, half);
+            put(true, false, half);
+            put(false, false, half / 2);
+            let mut bytes = vec![(u16::from(address) << 1 | u16::from(read)) << 1];
+            let last = payload.len().saturating_sub(1);
+            for (i, byte) in payload.iter().enumerate() {
+                // The master NACKs the last byte of a read.
+                let nack = read && i == last;
+                bytes.push((u16::from(*byte) << 1) | u16::from(nack));
+            }
+            for word in bytes {
+                for bit in (0..9).rev() {
+                    let level = (word >> bit) & 1 == 1;
+                    put(false, level, half / 2);
+                    put(true, level, half);
+                    put(false, level, half / 2);
+                }
+            }
+            // STOP
+            put(false, false, half / 2);
+            put(true, false, half);
+            put(true, true, 200);
+        }
+        scl.resize(POINTS, true);
+        sda.resize(POINTS, true);
+        capture(
+            100e-6,
+            vec![channel(1, 2.0, 1.0), channel(2, 2.0, -3.0)],
+            ("CH2", 1.65, "FALL"),
+            [
+                render(&scl, 0.0, 3.3, 0.25, n),
+                render(&sda, 0.0, 3.3, 0.18, n ^ 0x33),
+            ],
+        )
+    }
+
+    /// UART 115 200 Bd 8N1, 200 µs/div: a command on TX and the reply on RX.
+    pub fn uart_capture(n: u32) -> Capture {
+        let samples_per_bit = 2.5e6 / 115_200.0;
+        let line = |text: &[u8], idle_before: usize| {
+            let mut bits = vec![true; idle_before];
+            for byte in text {
+                bits.push(false);
+                bits.extend((0..8).map(|i| (byte >> i) & 1 == 1));
+                bits.push(true);
+                bits.push(true);
+            }
+            stretch(&bits, samples_per_bit)
+        };
+        let reply = format!("OK {}.{}V\r\n", 12 + n % 2, 40 + n % 9);
+        let tx = line(b"MEAS:VOLT?\r\n", 60);
+        let rx = line(reply.as_bytes(), 200);
+        capture(
+            200e-6,
+            vec![channel(1, 2.0, 0.5), channel(2, 2.0, -3.5)],
+            ("CH1", 1.65, "FALL"),
+            [
+                render(&tx, 0.0, 3.3, 0.5, n),
+                render(&rx, 0.0, 3.3, 0.5, n ^ 0x77),
+            ],
+        )
+    }
+}
+
+/// UART bytes grouped into lines: a pause longer than three character times, or a line feed,
+/// ends a group. Returns (start time, bytes).
+pub fn uart_lines(events: &[Event], baud: Option<f64>) -> Vec<(f64, Vec<u8>)> {
+    let char_time = baud.map_or(1e-3, |b| 10.0 / b);
+    let mut lines: Vec<(f64, f64, Vec<u8>)> = Vec::new();
+    for event in events {
+        let Event::Uart { t_s, value, .. } = event else {
+            continue;
+        };
+        match lines.last_mut() {
+            Some((_, last, bytes))
+                if *t_s - *last < 3.0 * char_time && bytes.last() != Some(&b'\n') =>
+            {
+                bytes.push(*value);
+                *last = *t_s;
+            }
+            _ => lines.push((*t_s, *t_s, vec![*value])),
         }
     }
+    lines
+        .into_iter()
+        .map(|(start, _, bytes)| (start, bytes))
+        .collect()
+}
+
+/// Bytes as readable text with escapes: `MEAS:VOLT?\r\n`.
+pub fn escape_text(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| match b {
+            b'\r' => "\\r".to_owned(),
+            b'\n' => "\\n".to_owned(),
+            b'\t' => "\\t".to_owned(),
+            b if b.is_ascii_graphic() || *b == b' ' => (*b as char).to_string(),
+            b => format!("\\x{b:02X}"),
+        })
+        .collect()
 }

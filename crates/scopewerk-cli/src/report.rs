@@ -302,6 +302,12 @@ pub(crate) fn decoded_json(decoded: &scopewerk_core::Decoded, limit: usize) -> V
             "thresholds_v": decoded.thresholds_v.iter().map(|(ch, v)| json!({"channel": ch, "volts": sig(*v, 3)})).collect::<Vec<_>>(),
         },
         "events": events,
+        "lines": (decoded.protocol == "UART").then(|| {
+            scopewerk_core::decode::uart_lines(&decoded.events, decoded.rate_hz)
+                .iter()
+                .map(|(t, bytes)| json!({"t_s": sig(*t, 6), "text": scopewerk_core::decode::escape_text(bytes)}))
+                .collect::<Vec<_>>()
+        }),
         "events_total": decoded.events.len(),
         "warnings": decoded.warnings,
         "time_note": "t_s is seconds from the trigger point",

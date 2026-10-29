@@ -1,11 +1,10 @@
 //! Sharing one scope. Only one process can hold the DOS1102's USB interface, so the Scopewerk
-//! app owns it while it runs and serves the same [`Request`]s over a Unix socket. The CLI and
+//! app owns it while it runs and serves the same [`Request`]s over a local endpoint (Unix socket,
+//! or loopback TCP with a token on Windows; see [`crate::endpoint`]). The CLI and
 //! the MCP server use a [`Session`]: through the app when it is running (you watch the agent
 //! work), straight over USB otherwise.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::{Action, ApplyReport, Change};
 use crate::decode::{self, DecodeConfig, Decoded};
+use crate::endpoint::{self, Duplex};
 use crate::header::Settings;
 use crate::scope::{Identity, Scope};
 use crate::waveform::Capture;
@@ -221,19 +221,9 @@ pub fn handle(scope: &mut Scope, request: &Request) -> Result<Reply, Error> {
     })
 }
 
-/// Where the app listens. `SCOPEWERK_SOCKET` overrides it.
-pub fn socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("SCOPEWERK_SOCKET") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Scopewerk/scopewerk.sock")
-    } else {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map_or_else(|| home.join(".scopewerk"), PathBuf::from)
-            .join("scopewerk.sock")
-    }
+/// Where the app listens, for messages.
+pub fn endpoint_location() -> String {
+    endpoint::location()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,7 +244,7 @@ enum Answer {
 pub enum Session {
     Local(Scope),
     App {
-        stream: BufReader<UnixStream>,
+        stream: BufReader<Box<dyn Duplex>>,
         client: String,
     },
 }
@@ -263,7 +253,7 @@ impl Session {
     /// Use the running Scopewerk app if there is one, else open the scope over USB. A scope
     /// that is briefly busy (another short-lived client) is retried for a few seconds.
     pub fn connect(client: &str) -> Result<Self, Error> {
-        if let Ok(stream) = UnixStream::connect(socket_path()) {
+        if let Ok(stream) = endpoint::connect() {
             return Ok(Self::App {
                 stream: BufReader::new(stream),
                 client: client.to_owned(),
@@ -326,25 +316,15 @@ fn broker_error(err: impl std::fmt::Display) -> Error {
 /// What the app plugs into [`serve`]: run a request from `client` and answer it.
 pub type Handler = Arc<dyn Fn(&str, Request) -> Result<Reply, String> + Send + Sync>;
 
-/// Listen on [`socket_path`] and answer every connection with `handler` on its own thread.
-/// A stale socket file from a crashed app is replaced; a live one makes this fail.
-pub fn serve(handler: Handler) -> Result<PathBuf, Error> {
-    let path = socket_path();
-    if UnixStream::connect(&path).is_ok() {
-        return Err(Error::Broker(format!(
-            "another Scopewerk app already serves {}",
-            path.display()
-        )));
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(broker_error)?;
-    }
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).map_err(broker_error)?;
+/// Listen on the local endpoint and answer every connection with `handler` on its own thread.
+/// A stale endpoint from a crashed app is replaced; a live one makes this fail. Returns where it
+/// listens.
+pub fn serve(handler: Handler) -> Result<String, Error> {
+    let listener = endpoint::listen()?;
     std::thread::Builder::new()
         .name("scopewerk-broker".into())
         .spawn(move || {
-            for stream in listener.incoming().flatten() {
+            while let Ok(stream) = listener.accept() {
                 let handler = Arc::clone(&handler);
                 let _ = std::thread::Builder::new()
                     .name("scopewerk-client".into())
@@ -352,17 +332,18 @@ pub fn serve(handler: Handler) -> Result<PathBuf, Error> {
             }
         })
         .map_err(broker_error)?;
-    Ok(path)
+    Ok(endpoint::location())
 }
 
-fn serve_client(stream: UnixStream, handler: &Handler) {
-    let Ok(mut writer) = stream.try_clone() else {
-        return;
-    };
-    for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else {
-            return;
-        };
+fn serve_client(stream: Box<dyn Duplex>, handler: &Handler) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
         let answer = match serde_json::from_str::<Envelope>(&line) {
             Ok(envelope) => match handler(&envelope.client, envelope.request) {
                 Ok(reply) => Answer::Ok(Box::new(reply)),
@@ -374,7 +355,7 @@ fn serve_client(stream: UnixStream, handler: &Handler) {
             return;
         };
         text.push('\n');
-        if writer.write_all(text.as_bytes()).is_err() {
+        if reader.get_mut().write_all(text.as_bytes()).is_err() {
             return;
         }
     }

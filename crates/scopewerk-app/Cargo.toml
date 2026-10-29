@@ -4,6 +4,8 @@ description = "Scopewerk: the Hanmatek DOS1102 oscilloscope as a native GPUI app
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "scopewerk-app"
@@ -13,5 +15,9 @@ path = "src/main.rs"
 scopewerk-core.workspace = true
 anyhow.workspace = true
 async-channel = "2"
+dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 gpui-kit = "0.7.3"
+
+[build-dependencies]
+embed-resource = "3"

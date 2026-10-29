@@ -1,0 +1,21 @@
+#!/bin/sh
+# Refuse commits that carry secrets or files that never belong in this public repo.
+# Enabled per clone with: git config core.hooksPath .githooks
+set -eu
+
+forbidden='^(tmp|dist|target)/|(^|/)\.env|\.(p12|pem|key|keychain)$|token\.json$|config\.toml$'
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$forbidden" || true)
+if [ -n "$bad" ]; then
+    echo "pre-commit: these files must not be committed:" >&2
+    echo "$bad" | sed 's/^/  /' >&2
+    exit 1
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks git --pre-commit --staged --redact --no-banner -v . || {
+        echo "pre-commit: gitleaks found a possible secret (see above)" >&2
+        exit 1
+    }
+else
+    echo "pre-commit: gitleaks is not installed (brew install gitleaks); secret scan skipped" >&2
+fi

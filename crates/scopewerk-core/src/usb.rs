@@ -89,6 +89,13 @@ impl Transport {
             .filter(is_scope)
             .find(|info| serial.is_none_or(|wanted| info.serial_number() == Some(wanted)))
             .ok_or(Error::NotFound)?;
+        // Windows only reaches the scope through WinUSB (installed once with Zadig).
+        #[cfg(target_os = "windows")]
+        if let Some(driver) = info.driver()
+            && !driver.eq_ignore_ascii_case("winusb")
+        {
+            return Err(Error::NeedsDriver(driver.to_owned()));
+        }
         let summary = DeviceSummary {
             product_id: info.product_id(),
             serial: info.serial_number().map(str::to_owned),

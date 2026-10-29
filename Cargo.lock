@@ -5675,18 +5675,20 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scopewerk-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
  "chrono",
+ "dirs 6.0.0",
+ "embed-resource",
  "gpui-kit",
  "scopewerk-core",
 ]
 
 [[package]]
 name = "scopewerk-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5697,9 +5699,10 @@ dependencies = [
 
 [[package]]
 name = "scopewerk-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
+ "dirs 6.0.0",
  "nusb",
  "png 0.17.16",
  "serde",
