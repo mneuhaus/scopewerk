@@ -85,8 +85,8 @@ pub(crate) fn decode_channel(channel: u8, payload: &[u8], header: &ScreenHeader)
     let volts_per_div = info.map_or(f64::NAN, ChannelHeader::tip_volts_per_div);
     let offset_counts = to_f64(info.map_or(0, |c| c.offset)) * COUNTS_PER_OFFSET_PIXEL;
     let mut volts = Vec::with_capacity(payload.len() / 2);
-    for pair in payload.chunks_exact(2) {
-        let counts = f64::from(i16::from_le_bytes([pair[0], pair[1]]));
+    for pair in payload.as_chunks::<2>().0 {
+        let counts = f64::from(i16::from_le_bytes(*pair));
         volts.push(narrow(
             volts_per_div * (counts - offset_counts) / COUNTS_PER_DIV,
         ));

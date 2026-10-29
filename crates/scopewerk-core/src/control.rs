@@ -416,6 +416,22 @@ impl Scope {
         Ok(self.header()?.settings())
     }
 
+    /// Snap and send changes against known settings without reading anything back: for
+    /// interactive front ends whose next frame shows the result anyway. Returns snap notes.
+    pub fn send_changes(
+        &mut self,
+        current: &Settings,
+        changes: &[Change],
+    ) -> Result<Vec<String>, Error> {
+        let mut notes = Vec::new();
+        for change in changes {
+            let (snapped, note) = change.snapped(current)?;
+            self.scpi(&snapped.command(current))?;
+            notes.extend(note);
+        }
+        Ok(notes)
+    }
+
     /// Apply changes in order, then read the header once and check every one of them.
     /// Probe changes go first so that V/div and trigger values are meant at the new probe.
     pub fn apply(&mut self, changes: &[Change]) -> Result<ApplyReport, Error> {

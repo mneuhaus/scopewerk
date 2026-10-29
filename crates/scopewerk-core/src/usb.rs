@@ -63,13 +63,14 @@ pub fn list() -> Result<Vec<DeviceSummary>, Error> {
         .map(|info| DeviceSummary {
             product_id: info.product_id(),
             serial: info.serial_number().map(str::to_owned),
-            bus: format!("{}", info.bus_id()),
+            bus: info.bus_id().to_string(),
         })
         .collect())
 }
 
 /// An opened, claimed scope that exchanges one command for one reply.
 pub(crate) struct Transport {
+    device: nusb::Device,
     // Keeps the claim alive for the endpoints.
     interface: Interface,
     out: Endpoint<Bulk, Out>,
@@ -91,7 +92,7 @@ impl Transport {
         let summary = DeviceSummary {
             product_id: info.product_id(),
             serial: info.serial_number().map(str::to_owned),
-            bus: format!("{}", info.bus_id()),
+            bus: info.bus_id().to_string(),
         };
         let device = info.open().wait().map_err(Error::Usb)?;
         let interface = device.claim_interface(0).wait().map_err(|err| {
@@ -109,22 +110,23 @@ impl Transport {
             .endpoint::<Bulk, In>(in_addr)
             .map_err(Error::Usb)?;
         let mut transport = Self {
-            interface: interface,
+            device,
+            interface,
             out,
             input,
             usbtmc: summary.product_id != PRODUCT_ID_RAW,
             tag: 0,
             summary,
         };
-        if transport.usbtmc {
-            // A previous program may have left a half-read reply behind.
-            transport.clear();
-        }
+        // A previous program may have left a half-read reply or a stalled pipe behind.
+        transport.clear();
         Ok(transport)
     }
 
-    /// USBTMC INITIATE_CLEAR: drop whatever the scope still had queued. Best effort; firmware
-    /// that does not support it simply stalls the request.
+    /// Bring the pipes back to a known state: USBTMC INITIATE_CLEAR (drops whatever the scope
+    /// still had queued), clear both endpoint halts (resets the data toggles) and drain stale
+    /// IN data. A program killed mid-transfer otherwise leaves every later transfer failing
+    /// with an overrun. Best effort throughout.
     fn clear(&mut self) {
         const INITIATE_CLEAR: u8 = 5;
         const CHECK_CLEAR_STATUS: u8 = 6;
@@ -138,37 +140,52 @@ impl Transport {
             length,
         };
         let timeout = Duration::from_millis(500);
-        if self
-            .interface
-            .control_in(request(INITIATE_CLEAR, 1), timeout)
-            .wait()
-            .is_err()
-        {
-            return;
-        }
-        for _ in 0..20 {
-            match self
+        if self.usbtmc
+            && self
                 .interface
-                .control_in(request(CHECK_CLEAR_STATUS, 2), timeout)
+                .control_in(request(INITIATE_CLEAR, 1), timeout)
                 .wait()
-            {
-                Ok(status) if status.first() == Some(&STATUS_PENDING) => {
-                    std::thread::sleep(Duration::from_millis(10));
+                .is_ok()
+        {
+            for _ in 0..20 {
+                match self
+                    .interface
+                    .control_in(request(CHECK_CLEAR_STATUS, 2), timeout)
+                    .wait()
+                {
+                    Ok(status) if status.first() == Some(&STATUS_PENDING) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
         let _ = self.out.clear_halt().wait();
+        let _ = self.input.clear_halt().wait();
+        for _ in 0..8 {
+            let completion = self
+                .input
+                .transfer_blocking(Buffer::new(READ_BUFFER), Duration::from_millis(30));
+            if completion.status.is_err() {
+                break;
+            }
+        }
     }
 
-    /// Send one command and return the complete reply (empty for set commands).
+    /// Send one command and return the complete reply (empty for set commands). A pipe error
+    /// gets one retry after [`Self::clear`]; if that fails too the scope is reset on the bus
+    /// (it re-enumerates) and the caller sees [`Error::Disconnected`] and reconnects.
     pub(crate) fn query(&mut self, command: &str) -> Result<Vec<u8>, Error> {
         let started = std::time::Instant::now();
-        let reply = if self.usbtmc {
-            self.query_usbtmc(command)
-        } else {
-            self.query_raw(command)
-        };
+        let mut reply = self.query_once(command);
+        if matches!(reply, Err(Error::Transfer(_) | Error::OutOfSync)) {
+            self.clear();
+            reply = self.query_once(command);
+            if matches!(reply, Err(Error::Transfer(_) | Error::OutOfSync)) {
+                let _ = self.device.reset().wait();
+                reply = Err(Error::Disconnected);
+            }
+        }
         if std::env::var_os("SCOPEWERK_TRACE").is_some() {
             let size = reply.as_ref().map_or(0, Vec::len);
             eprintln!(
@@ -177,6 +194,14 @@ impl Transport {
             );
         }
         reply
+    }
+
+    fn query_once(&mut self, command: &str) -> Result<Vec<u8>, Error> {
+        if self.usbtmc {
+            self.query_usbtmc(command)
+        } else {
+            self.query_raw(command)
+        }
     }
 
     fn next_tag(&mut self) -> u8 {

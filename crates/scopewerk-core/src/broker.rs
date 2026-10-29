@@ -173,7 +173,7 @@ struct Envelope {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Answer {
-    Ok(Reply),
+    Ok(Box<Reply>),
     Error(String),
 }
 
@@ -233,11 +233,13 @@ impl Session {
                     ));
                 }
                 match serde_json::from_str::<Answer>(&answer).map_err(broker_error)? {
-                    Answer::Ok(Reply::Status(mut status)) => {
-                        status.via = "app".into();
-                        Ok(Reply::Status(status))
-                    }
-                    Answer::Ok(reply) => Ok(reply),
+                    Answer::Ok(reply) => match *reply {
+                        Reply::Status(mut status) => {
+                            status.via = "app".into();
+                            Ok(Reply::Status(status))
+                        }
+                        reply => Ok(reply),
+                    },
                     Answer::Error(message) => Err(Error::Broker(message)),
                 }
             }
@@ -291,7 +293,7 @@ fn serve_client(stream: UnixStream, handler: &Handler) {
         };
         let answer = match serde_json::from_str::<Envelope>(&line) {
             Ok(envelope) => match handler(&envelope.client, envelope.request) {
-                Ok(reply) => Answer::Ok(reply),
+                Ok(reply) => Answer::Ok(Box::new(reply)),
                 Err(message) => Answer::Error(message),
             },
             Err(err) => Answer::Error(format!("bad request: {err}")),

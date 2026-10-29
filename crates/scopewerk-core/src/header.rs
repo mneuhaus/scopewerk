@@ -218,6 +218,11 @@ impl ChannelHeader {
 }
 
 impl Settings {
+    /// The header reports `STOP` while acquisition is halted (Run/Stop, or after a single shot).
+    pub fn is_stopped(&self) -> bool {
+        self.run_status.eq_ignore_ascii_case("STOP")
+    }
+
     pub fn channel(&self, channel: u8) -> Option<&ChannelSettings> {
         self.channels.iter().find(|c| c.channel == channel)
     }

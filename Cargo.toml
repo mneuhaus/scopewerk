@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/scopewerk-core", "crates/scopewerk-cli"]
+members = ["crates/scopewerk-core", "crates/scopewerk-cli", "crates/scopewerk-app"]
 
 [workspace.package]
 version = "0.1.0"
