@@ -195,8 +195,11 @@ the instrument:
 - Screenshot `:DATA:WAVE:SCREen:BMP?`: an 800 × 480 BMP (1.15 MB, about 1.6 s). It must be
   requested in one USBTMC transfer, and the firmware then queues a stray `"…->\n"` message that
   has to be read and dropped.
-- Each data query takes about 250 ms inside the scope (USB itself takes microseconds), so a live
-  view of both channels runs at about 1.5 frames per second, one channel about 2.5.
+- Each data query takes about 250 ms inside the scope (USB itself takes microseconds). Trace
+  positions follow from the raw counts alone (400 per division from the screen centre), so the
+  live view reads only channel data per frame and the header every 1.5 s and after every change:
+  about two frames per second with both channels, four with one. Clicks interrupt a running
+  frame, and the window re-projects the stored samples with new settings at once.
 - Settings: `:HORIzontal:SCALe 1.0ms` (a bare `1ms` is ignored), `:HORIzontal:OFFSet <div>`,
   `:CHn:SCALe 500mV`, `:CHn:OFFSet <div>`, `:CHn:COUPling DC|AC|GND`, `:CHn:PROBe 10X`,
   `:CHn:DISPlay ON|OFF`, `:CHn:INVerse ON|OFF`, `:TRIGger:SINGle:EDGE:SOURce|SLOPe|LEVel|COUPling`,

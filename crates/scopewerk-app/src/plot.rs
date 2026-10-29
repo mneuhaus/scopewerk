@@ -11,7 +11,7 @@ use gpui_kit::{
 };
 use scopewerk_core::decode::{Annotation, Mark};
 use scopewerk_core::header::{HORIZONTAL_DIVS, VERTICAL_DIVS};
-use scopewerk_core::{Capture, Settings};
+use scopewerk_core::{Capture, ChannelSettings, Settings};
 
 use crate::theme;
 
@@ -150,6 +150,14 @@ pub(crate) fn plot(scene: Scene, geometry: Rc<Cell<Option<Geometry>>>) -> impl I
 }
 
 fn paint(scene: &Scene, g: Geometry, window: &mut Window, cx: &mut App) {
+    let started = std::time::Instant::now();
+    paint_screen(scene, g, window, cx);
+    if std::env::var_os("SCOPEWERK_TRACE").is_some() {
+        eprintln!("scopewerk: paint {:?}", started.elapsed());
+    }
+}
+
+fn paint_screen(scene: &Scene, g: Geometry, window: &mut Window, cx: &mut App) {
     window.paint_quad(fill(g.screen, theme::screen_bg()));
     paint_grid(g, window);
 
@@ -171,6 +179,7 @@ fn paint(scene: &Scene, g: Geometry, window: &mut Window, cx: &mut App) {
                 paint_trace(
                     frame,
                     waveform.channel,
+                    view_of(scene, frame),
                     g,
                     theme::with_alpha(theme::channel(waveform.channel), alpha),
                     window,
@@ -186,12 +195,15 @@ fn paint(scene: &Scene, g: Geometry, window: &mut Window, cx: &mut App) {
                 window,
             );
             if let Some(frame) = scene.frames.last() {
-                let t = time_of(x_div, &frame.settings);
+                let view = view_of(scene, frame);
+                let t = time_of(x_div, view);
                 for waveform in &frame.waveforms {
-                    if let (Some(v), Some(channel)) = (
+                    if let (Some(v), Some(channel), Some(captured)) = (
                         value_at(frame, waveform.channel, t),
+                        view.channel(waveform.channel),
                         frame.settings.channel(waveform.channel),
                     ) {
+                        let v = v * probe_ratio(channel, captured);
                         let y = g.y(v / channel.volts_per_div + channel.offset_div);
                         let dot = Bounds::new(
                             point(px(g.x(x_div) - 3.0), px(y - 3.0)),
@@ -318,21 +330,49 @@ fn paint_vline(g: Geometry, x: f32, color: Hsla, width: f32, window: &mut Window
     window.paint_quad(fill(bounds, color));
 }
 
-fn paint_trace(frame: &Capture, channel: u8, g: Geometry, color: Hsla, window: &mut Window) {
-    let (Some(waveform), Some(settings)) =
-        (frame.waveform(channel), frame.settings.channel(channel))
-    else {
+/// The settings a frame is drawn with: the window's, which run ahead of the scope right after a
+/// click. Stored volts and times are re-projected at once, the way a digital scope rescales its
+/// acquisition before the next one arrives.
+fn view_of<'a>(scene: &'a Scene, frame: &'a Capture) -> &'a Settings {
+    scene.settings.as_ref().unwrap_or(&frame.settings)
+}
+
+/// A probe switched in the window but not yet in the data scales the stored volts.
+fn probe_ratio(shown: &ChannelSettings, captured: &ChannelSettings) -> f64 {
+    let factor = |probe: &str| {
+        probe
+            .trim_end_matches(['X', 'x'])
+            .parse::<f64>()
+            .unwrap_or(1.0)
+    };
+    factor(&shown.probe) / factor(&captured.probe)
+}
+
+fn paint_trace(
+    frame: &Capture,
+    channel: u8,
+    view: &Settings,
+    g: Geometry,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let (Some(waveform), Some(captured), Some(settings)) = (
+        frame.waveform(channel),
+        frame.settings.channel(channel),
+        view.channel(channel),
+    ) else {
         return;
     };
-    if waveform.volts.len() < 2 || !settings.volts_per_div.is_finite() {
+    if waveform.volts.len() < 2 || !settings.enabled || !settings.volts_per_div.is_finite() {
         return;
     }
+    let ratio = probe_ratio(settings, captured);
     let limit = f64::from(VERTICAL_DIVS as f32 / 2.0 + 0.3);
     let y_of = |volts: f32| {
-        let y_div = f64::from(volts) / settings.volts_per_div + settings.offset_div;
+        let y_div = f64::from(volts) * ratio / settings.volts_per_div + settings.offset_div;
         g.y(y_div.clamp(-limit, limit))
     };
-    let x_of = |index: usize| g.x(x_div_of(frame.time_at(index), &frame.settings));
+    let x_of = |index: usize| g.x(x_div_of(frame.time_at(index), view));
 
     let mut path = PathBuilder::stroke(px(1.4));
     let columns = f32::from(g.screen.size.width).max(1.0);

@@ -8,7 +8,7 @@ use crate::Error;
 use crate::header::{PIXELS_PER_DIV, ScreenHeader, to_f64};
 use crate::units::parse_quantity;
 use crate::usb::{DeviceSummary, Transport};
-use crate::waveform::{Capture, decode_channel};
+use crate::waveform::{Capture, Waveform, decode_channel};
 
 /// `*IDN?` split into its fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,45 +93,46 @@ impl Scope {
     ) -> Result<Capture, Error> {
         let mut waveforms = Vec::with_capacity(channels.len());
         for &channel in channels {
-            check_channel(channel)?;
-            let payload = self.framed(&format!(":DATA:WAVE:SCREen:CH{channel}?"))?;
-            waveforms.push(decode_channel(channel, &payload, header));
+            waveforms.push(self.read_waveform(header, channel, false)?);
         }
-        let dt = header.seconds_per_point();
-        let points = waveforms.iter().map(|w| w.volts.len()).max().unwrap_or(0);
-        Ok(Capture {
-            captured_at_ms: now_ms(),
-            settings: header.settings(),
-            dt,
-            t0: -(to_f64(points) / 2.0) * dt + hoffset_seconds(header),
-            waveforms,
-        })
+        Ok(assemble(header, waveforms, false))
     }
 
     /// Read the acquisition memory (all samples at the real sample rate, typically 10 000
     /// points, 5x the screen resolution) of the given channels.
     pub fn capture_memory(&mut self, channels: &[u8]) -> Result<Capture, Error> {
+        let screen = self.header()?;
+        let header = self.memory_header(&screen)?;
+        let mut waveforms = Vec::with_capacity(channels.len());
+        for &channel in channels {
+            waveforms.push(self.read_waveform(&header, channel, true)?);
+        }
+        Ok(assemble(&header, waveforms, true))
+    }
+
+    /// The acquisition memory's header (sample rate, where the screen sits in the record). It has
+    /// no trigger block, so the trigger comes from the given screen header.
+    pub fn memory_header(&mut self, screen: &ScreenHeader) -> Result<ScreenHeader, Error> {
         let payload = self.framed(":DATA:WAVE:DEPMem:HEAD?")?;
         let mut header: ScreenHeader = serde_json::from_slice(&payload)
             .map_err(|err| Error::Protocol(format!("memory header: {err}")))?;
-        // The memory header has no trigger block; the screen header does.
-        header.trigger = self.header()?.trigger;
-        let mut waveforms = Vec::with_capacity(channels.len());
-        for &channel in channels {
-            check_channel(channel)?;
-            let payload = self.framed(&format!(":DATA:WAVE:DEPMem:CH{channel}?"))?;
-            waveforms.push(decode_channel(channel, &payload, &header));
-        }
-        let rate = parse_quantity(&header.sample.sample_rate).unwrap_or(f64::NAN);
-        let dt = 1.0 / rate;
-        let screen_centre = header.sample.screen_offset + header.sample.full_screen / 2;
-        Ok(Capture {
-            captured_at_ms: now_ms(),
-            settings: header.settings(),
-            dt,
-            t0: -to_f64(screen_centre) * dt + hoffset_seconds(&header),
-            waveforms,
-        })
+        header.trigger = screen.trigger.clone();
+        Ok(header)
+    }
+
+    /// One channel's screen points (`memory: false`, with a screen header) or memory samples
+    /// (`memory: true`, with a [`Self::memory_header`]). The building block of live views
+    /// that refresh the header less often than the traces.
+    pub fn read_waveform(
+        &mut self,
+        header: &ScreenHeader,
+        channel: u8,
+        memory: bool,
+    ) -> Result<Waveform, Error> {
+        check_channel(channel)?;
+        let source = if memory { "DEPMem" } else { "SCREen" };
+        let payload = self.framed(&format!(":DATA:WAVE:{source}:CH{channel}?"))?;
+        Ok(decode_channel(channel, &payload, header))
     }
 
     /// The scope's display exactly as it looks right now: a 24-bit 800×480 BMP (about 1.6 s).
@@ -162,6 +163,27 @@ impl Scope {
             .unwrap_or(usize::MAX);
         let end = (4 + length).min(reply.len());
         Ok(reply[4..end].to_vec())
+    }
+}
+
+/// Build a capture from waveforms read with `header` (a memory header when `memory`).
+pub fn assemble(header: &ScreenHeader, waveforms: Vec<Waveform>, memory: bool) -> Capture {
+    let (dt, t0) = if memory {
+        let rate = parse_quantity(&header.sample.sample_rate).unwrap_or(f64::NAN);
+        let dt = 1.0 / rate;
+        let screen_centre = header.sample.screen_offset + header.sample.full_screen / 2;
+        (dt, -to_f64(screen_centre) * dt + hoffset_seconds(header))
+    } else {
+        let dt = header.seconds_per_point();
+        let points = waveforms.iter().map(|w| w.volts.len()).max().unwrap_or(0);
+        (dt, -(to_f64(points) / 2.0) * dt + hoffset_seconds(header))
+    };
+    Capture {
+        captured_at_ms: now_ms(),
+        settings: header.settings(),
+        dt,
+        t0,
+        waveforms,
     }
 }
 

@@ -2,18 +2,24 @@
 //! frames to the window, and runs jobs from the window and from broker clients (CLI, MCP) one at
 //! a time between frames.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use scopewerk_core::broker::{self, Handler};
-use scopewerk_core::{Capture, Change, Error, Identity, Reply, Request, Scope, Settings};
+use scopewerk_core::scope::assemble;
+use scopewerk_core::{
+    Capture, Change, Error, Identity, Reply, Request, Scope, ScreenHeader, Settings,
+};
 
 /// How often to look for a scope while none is connected.
 const RECONNECT_EVERY: Duration = Duration::from_secs(1);
 /// Frames while the scope is stopped only need to notice knob changes on the device.
 const STOPPED_FRAME_EVERY: Duration = Duration::from_millis(900);
+/// How long a screen header serves frames before it is read again (about 150-250 ms each).
+const HEADER_EVERY: Duration = Duration::from_millis(1500);
 
 /// What the window hears from the scope thread.
 #[derive(Debug)]
@@ -158,6 +164,20 @@ struct Worker {
     done_seq: u64,
     last_frame: Option<Instant>,
     stopped: bool,
+    /// The headers the last frames were read with; refreshed every [`HEADER_EVERY`] and after
+    /// every change. Trace positions do not depend on them (screen data is in divisions), only
+    /// volts and times do, so knob changes on the device show up at once.
+    header: Option<CachedHeader>,
+    /// Jobs that arrived while a frame was being read; they run before the next frame.
+    backlog: VecDeque<Job>,
+}
+
+#[derive(Clone)]
+struct CachedHeader {
+    screen: ScreenHeader,
+    /// Set in memory mode.
+    memory: Option<ScreenHeader>,
+    at: Instant,
 }
 
 impl Worker {
@@ -173,6 +193,8 @@ impl Worker {
             done_seq: 0,
             last_frame: None,
             stopped: false,
+            header: None,
+            backlog: VecDeque::new(),
         }
     }
 
@@ -203,7 +225,11 @@ impl Worker {
                 }
             }
 
-            // Jobs first, so clicks and agents never wait behind more than one frame.
+            // Jobs first, so clicks and agents never wait behind a frame: jobs that interrupted
+            // the last frame, then whatever is queued.
+            while let Some(job) = self.backlog.pop_front() {
+                self.run_job(job);
+            }
             let wait = if self.scope.is_some() && self.frame_due() {
                 Duration::ZERO
             } else {
@@ -238,30 +264,74 @@ impl Worker {
         self.last_frame.is_none_or(|t| t.elapsed() >= interval)
     }
 
+    /// One live frame: the cached header (refreshed when stale), then one query per enabled
+    /// channel. A job arriving between queries ends the frame early; the job runs first.
     fn frame(&mut self) {
         self.last_frame = Some(Instant::now());
         let memory = self.live.memory;
-        let result = self.with_scope(|scope| {
-            let header = scope.header()?;
-            let channels: Vec<u8> = header
-                .settings()
-                .channels
-                .iter()
-                .filter(|c| c.enabled)
-                .map(|c| c.channel)
-                .collect();
-            if memory {
-                scope.capture_memory(&channels)
-            } else {
-                scope.capture_with(&header, &channels)
-            }
-        });
-        if let Some(capture) = result {
-            self.stopped = capture.settings.is_stopped();
-            self.emit(Event::Frame {
-                capture: Box::new(capture),
-                job_seq: self.done_seq,
+        let stale = self
+            .header
+            .as_ref()
+            .is_none_or(|h| h.at.elapsed() >= HEADER_EVERY || h.memory.is_some() != memory);
+        if stale {
+            let fresh = self.with_scope(|scope| {
+                let screen = scope.header()?;
+                let memory_header = if memory {
+                    Some(scope.memory_header(&screen)?)
+                } else {
+                    None
+                };
+                Ok(CachedHeader {
+                    screen,
+                    memory: memory_header,
+                    at: Instant::now(),
+                })
             });
+            let Some(fresh) = fresh else {
+                return;
+            };
+            self.header = Some(fresh);
+        }
+        let Some(cached) = self.header.clone() else {
+            return;
+        };
+        let header = cached.memory.as_ref().unwrap_or(&cached.screen);
+        let channels: Vec<u8> = cached
+            .screen
+            .settings()
+            .channels
+            .iter()
+            .filter(|c| c.enabled)
+            .map(|c| c.channel)
+            .collect();
+        let mut waveforms = Vec::with_capacity(channels.len());
+        for channel in channels {
+            if self.job_waiting() {
+                return;
+            }
+            let Some(waveform) =
+                self.with_scope(|scope| scope.read_waveform(header, channel, memory))
+            else {
+                return;
+            };
+            waveforms.push(waveform);
+        }
+        let capture = assemble(header, waveforms, memory);
+        self.stopped = capture.settings.is_stopped();
+        self.emit(Event::Frame {
+            capture: Box::new(capture),
+            job_seq: self.done_seq,
+        });
+    }
+
+    /// Move a queued job to the backlog; `true` when there was one.
+    fn job_waiting(&mut self) -> bool {
+        match self.jobs.try_recv() {
+            Ok(job) => {
+                self.backlog.push_back(job);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -287,6 +357,7 @@ impl Worker {
                 }
                 self.done_seq = seq;
                 self.last_frame = None;
+                self.header = None;
             }
             Job::Request {
                 seq,
@@ -330,6 +401,7 @@ impl Worker {
                 self.done_seq = seq;
                 if changes_scope {
                     self.last_frame = None;
+                    self.header = None;
                 }
             }
         }

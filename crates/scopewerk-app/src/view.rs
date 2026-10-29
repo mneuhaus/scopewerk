@@ -997,7 +997,7 @@ impl ScopeView {
     fn readout(&self) -> Div {
         let mut rows: Vec<Div> = Vec::new();
         if let (Some(frame), Some(x_div)) = (self.frames.back(), self.hover_x_div) {
-            let t = time_of(x_div, &frame.settings);
+            let t = time_of(x_div, self.settings.as_ref().unwrap_or(&frame.settings));
             let mut row = div()
                 .flex()
                 .gap(px(12.0))
